@@ -199,6 +199,45 @@ class Modes(unittest.TestCase):
             tx.audio_out(out, 512, None, None)
             self.assertTrue(np.isfinite(out).all(), mode)
 
+    def test_volume_is_per_station(self):
+        tx = make((0, 1))
+        tx.listen = "Demodulated"
+        tx.channels[1].volume = 0.0
+        out = np.zeros((512, 1))
+
+        def peak(seconds=0.5):
+            """Highest output, after any ramp has finished."""
+            got = []
+            for _ in range(int(seconds * SAMPLE_RATE / 512)):
+                tx.audio_out(out, 512, None, None)
+                got.append(out[:, 0].copy())
+            return np.abs(np.concatenate(got)[2048:]).max()
+
+        peak(2)
+        normal = peak(2)
+        self.assertGreater(normal, 0.02)
+        tx.selected = 1
+        self.assertEqual(peak(), 0.0)               # silenced station
+        self.assertGreater(np.abs(tx.capture.last("demod", 4096)).max(), 0.02)
+        tx.selected = 0
+        self.assertGreater(peak(2), 0.5 * normal)   # the other one is unaffected
+        tx.channels[0].volume = 0.5
+        self.assertAlmostEqual(peak(2) / normal, 0.5, delta=0.05)
+
+    def test_no_click_when_volume_moves(self):
+        tx = make()
+        tx.listen = "Low-passed"                    # about 1.0 throughout
+        tx.channels[0].m = 0.0
+        out = np.zeros((512, 1))
+        for _ in range(100):
+            tx.audio_out(out, 512, None, None)
+        got = []
+        for volume in (0.0, 2.0, 1.0):
+            tx.channels[0].volume = volume
+            tx.audio_out(out, 512, None, None)
+            got.append(out[:, 0].copy())
+        self.assertLess(np.abs(np.diff(np.concatenate(got))).max(), 0.003)
+
     def test_muted_while_any_channel_records(self):
         tx = make((0, 1))
         tx.channels[1].looper.recording = True

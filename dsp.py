@@ -15,6 +15,7 @@ from scipy.io import wavfile
 
 SAMPLE_RATE = 44100     # audio samples per second (Nyquist = 22.05 kHz)
 OUTPUT_GAIN = 0.2       # overall speaker level; keep it modest
+MAX_VOLUME = 2.0        # top of each station's volume control (1 = normal)
 
 # Channels. Each needs 2 × MESSAGE_BW_HZ = 6 kHz of spectrum, so three of them
 # only just fit under Nyquist: the defaults leave 250 Hz between neighbours.
@@ -236,6 +237,7 @@ class Channel:
         self.looper = Looper()
         self.m = START_M
         self.on_air = False
+        self.volume = 1.0           # speaker level while this station is the chosen one
         self.distance_km = MIN_KM
         self.skywave = 0.0          # 0 = day (ground wave only) … 1 = full night
         self._rng = rng
@@ -515,6 +517,7 @@ class Transmission:
         self.ab_playing = AB_SOURCES[0]     # which side of the A/B mode is sounding
         self.snr_db = None                  # wanted station vs everything else, after the tuner
         self._tuned_to = 0
+        self._volume = Smooth(1.0)
         self._powers = None
         # How far each receiver stage lags the transmitter, for the plots.
         self.delays = {"agc": self.tuner.delay,
@@ -584,4 +587,7 @@ class Transmission:
         self.snr_db = 10 * np.log10(max(w, 1e-20) / max(u, 1e-20)) if on_air else None
 
     def audio_out(self, outdata, frames, time_info, status):
-        outdata[:, 0] = np.clip(OUTPUT_GAIN * self.process(frames), -1.0, 1.0)
+        # Volume comes after everything else. Turning the transmitter down instead
+        # would do nothing: the AGC would turn it back up.
+        volume = self._volume.block(self.channel.volume, frames)
+        outdata[:, 0] = np.clip(OUTPUT_GAIN * volume * self.process(frames), -1.0, 1.0)

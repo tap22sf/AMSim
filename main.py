@@ -20,6 +20,7 @@ Controls:
                            capture.py records what the PC is playing)
     Clear                  discard the message
     On air                 transmitter on / off (goes on when you give it a message)
+    Volume                 speaker level while this channel is chosen (0 - 200 %)
     m slider               modulation index (0 - 1.5; above 1 = overmodulation)
     Distance               1 - 500 km to the receiver
     Skywave                fading from a second path via the ionosphere (day - night)
@@ -42,8 +43,8 @@ import sounddevice as sd
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from dsp import (AB_MODE, AB_SOURCES, DETECTOR_BW_HZ, FFT_N, LISTEN_CHANNEL, LISTEN_MODES,
-                 MAX_KM, MAX_RECORD_S, MAX_WAV_S, MESSAGE_BW_HZ, MIN_KM, SAMPLE_RATE,
-                 Transmission, load_wav)
+                 MAX_KM, MAX_RECORD_S, MAX_VOLUME, MAX_WAV_S, MESSAGE_BW_HZ, MIN_KM,
+                 SAMPLE_RATE, Transmission, load_wav)
 
 # QShortcut lives in QtGui on Qt6 and QtWidgets on Qt5.
 QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
@@ -323,6 +324,7 @@ class MainWindow(QtWidgets.QWidget):
         self.clear_btn = QtWidgets.QPushButton("Clear")
         self.air_box = QtWidgets.QCheckBox("On air")
         self.fc_label = QtWidgets.QLabel()
+        self.vol_slider, self.vol_label = self.make_slider(round(MAX_VOLUME * 100), 110, 40)
         self.m_slider, self.m_label = self.make_slider(150, 130, 60)
         self.km_slider, self.km_label = self.make_slider(KM_STEPS, 150, 60)
         self.sky_slider, self.sky_label = self.make_slider(100, 130, 80)
@@ -351,6 +353,7 @@ class MainWindow(QtWidgets.QWidget):
         self.open_btn.clicked.connect(self.on_open)
         self.clear_btn.clicked.connect(self.on_clear)
         self.air_box.toggled.connect(self.on_air_toggled)
+        self.vol_slider.valueChanged.connect(self.on_volume_changed)
         self.m_slider.valueChanged.connect(self.on_m_changed)
         self.km_slider.valueChanged.connect(self.on_km_changed)
         self.sky_slider.valueChanged.connect(self.on_sky_changed)
@@ -372,7 +375,8 @@ class MainWindow(QtWidgets.QWidget):
         self.channel_group = QtWidgets.QGroupBox()
         box = QtWidgets.QVBoxLayout(self.channel_group)
         box.addLayout(row(self.record_btn, self.stop_btn, self.open_btn, self.clear_btn, 12,
-                          self.air_box, 12, self.fc_label))
+                          self.air_box, 12, "Volume", self.vol_slider, self.vol_label, 12,
+                          self.fc_label))
         box.addLayout(row("Modulation", self.m_slider, self.m_label, 8,
                           "Distance", self.km_slider, self.km_label, 8,
                           "Skywave", self.sky_slider, self.sky_label))
@@ -517,7 +521,7 @@ class MainWindow(QtWidgets.QWidget):
         self.channel_btns.button(index).setChecked(True)
         self.channel_group.setTitle(f"Channel {ch.number}")
         km_pos = KM_STEPS * np.log(ch.distance_km / MIN_KM) / np.log(MAX_KM / MIN_KM)
-        for slider, value in ((self.m_slider, ch.m * 100), (self.km_slider, km_pos),
+        for slider, value in ((self.vol_slider, ch.volume * 100), (self.m_slider, ch.m * 100), (self.km_slider, km_pos),
                               (self.sky_slider, ch.skywave * 100)):
             # Show the channel's settings without writing (rounded) values back to it.
             slider.blockSignals(True)
@@ -529,6 +533,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def show_channel_labels(self):
         ch = self.tx.channel
+        self.vol_label.setText(f"{ch.volume:.0%}")
         self.m_label.setText(f"m = {ch.m:.2f}")
         km = ch.distance_km
         self.km_label.setText(f"{km:.1f} km" if km < 10 else f"{km:.0f} km")
@@ -585,6 +590,10 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_m_changed(self, value):
         self.tx.channel.m = value / 100
+        self.show_channel_labels()
+
+    def on_volume_changed(self, value):
+        self.tx.channel.volume = value / 100
         self.show_channel_labels()
 
     def on_km_changed(self, value):
