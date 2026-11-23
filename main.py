@@ -1,296 +1,66 @@
 """AM (amplitude modulation) transmission simulator.
 
-A recorded voice clip is the message x(t); the sine generator is the carrier.
+Up to three stations share the air. Each has a recorded voice clip or a WAV file
+as its message x(t) and a sine generator as its carrier.
 
     Transmitter:  s(t) = [1 + m * x(t)] * sin(2*pi*fc*t)
-    Receiver:     envelope detector = rectify -> low-pass -> remove DC
+    Air:          all stations, weakened by distance and fading, plus noise
+    Receiver:     tuner -> AGC -> envelope detector = rectify -> low-pass -> remove DC
 
 Controls:
+    CH 1 / 2 / 3           (or keys 1 - 3) choose the station that the channel
+                           controls edit and the receiver is tuned to
+  For the chosen channel:
     Up / Down              carrier frequency ±100 Hz
     Shift + Up / Down      carrier frequency ±10 Hz
     PageUp / PageDown      carrier frequency ±1 kHz
     Record / Stop          capture the message from the microphone
+    Open WAV…              use a WAV file as the message (or: python main.py a.wav
+                           [b.wav [c.wav]] for channels 1 - 3;
+                           capture.py records what the PC is playing)
     Clear                  discard the message
+    On air                 transmitter on / off (goes on when you give it a message)
     m slider               modulation index (0 - 1.5; above 1 = overmodulation)
+    Distance               1 - 500 km to the receiver
+    Skywave                fading from a second path via the ionosphere (day - night)
+  For everything:
+    Weather                static and lightning (clear - thunderstorm)
     Listen                 what goes to the speakers (any transmitter or receiver
                            stage); the spectrum plot follows this choice
     Receiver view          time span of the receiver-stage plots
+
+The signal processing is in dsp.py.
 """
 
+import os
+import sys
 import time
 
 import numpy as np
 import pyqtgraph as pg
 import sounddevice as sd
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from scipy import signal as sps
+
+from dsp import (AB_MODE, AB_SOURCES, DETECTOR_BW_HZ, FFT_N, LISTEN_CHANNEL, LISTEN_MODES,
+                 MAX_KM, MAX_RECORD_S, MAX_WAV_S, MESSAGE_BW_HZ, MIN_KM, SAMPLE_RATE,
+                 Transmission, load_wav)
 
 # QShortcut lives in QtGui on Qt6 and QtWidgets on Qt5.
 QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
-
-SAMPLE_RATE = 44100     # audio samples per second (Nyquist = 22.05 kHz)
-OUTPUT_GAIN = 0.2       # overall speaker level; keep it modest
 
 # Where to play. Words that must all appear in the device's "name, host API"
 # (see `python -m sounddevice`). None = the Windows default output.
 OUTPUT_DEVICE = None
 
-# Carrier
-START_FC_HZ = 8000.0
-MIN_FC_HZ = 10.0
-MAX_FC_HZ = 18000.0     # fc + message bandwidth must stay below Nyquist
-
-# Message
-MESSAGE_BW_HZ = 3000.0  # voice is low-passed to this (telephone-quality speech)
-
-# Receiver
-DETECTOR_BW_HZ = 4000.0 # envelope detector's low-pass cutoff: above the message
-                        # band so it doesn't dull the voice a second time
-OVERSAMPLE = 8          # the transmitter and detector run at 8 × 44.1 = 352.8 kHz so
-                        # the rectifier's carrier harmonics (2fc, 4fc, 6fc …) don't
-                        # alias back into the audio band. A real diode is analog and
-                        # has no such problem; this makes the simulation behave like it.
-MAX_RECORD_S = 30.0
-START_M = 0.8           # modulation index
-
 # Display
 CARRIER_CYCLES = 3      # carrier plot shows this many cycles, in slow motion
 CARRIER_POINTS = 1000
 SLOWMO = 0.02           # carrier plot speed (real time would alias at 60 fps)
-FFT_N = 8192            # spectrum resolution: 44100 / 8192 ≈ 5.4 Hz per bin
 FPS = 60
-
-AB_MODE = "A/B: Original ⇄ Recovered"   # alternates on every pass of the loop
-AB_SOURCES = ("Original", "Recovered")
-LISTEN_MODES = ["AM signal", "Rectified", "Low-passed", "Demodulated", "Message",
-                "Original recording", AB_MODE, "Carrier"]
-START_LISTEN = "Original recording"
-# Which captured channel each Listen choice corresponds to (for the spectrum).
-LISTEN_CHANNEL = {"AM signal": "am", "Rectified": "rectified", "Low-passed": "lowpassed",
-                  "Demodulated": "demod", "Message": "message",
-                  "Original recording": "original", AB_MODE: "out", "Carrier": "carrier"}
 RECEIVER_VIEWS_MS = [2, 5, 20, 50]   # time spans offered for the receiver-stage plots
 START_RECEIVER_VIEW_MS = 5
-
-
-class Carrier:
-    """Unit-amplitude sine. Frequency is shared by the GUI and the audio thread."""
-
-    def __init__(self, freq_hz):
-        self.freq_hz = freq_hz
-        self._phase = 0.0
-
-    def nudge(self, delta_hz):
-        self.freq_hz = float(np.clip(self.freq_hz + delta_hz, MIN_FC_HZ, MAX_FC_HZ))
-
-    def render(self, frames, rate=SAMPLE_RATE):
-        """Next block at the given sample rate. Phase carries over between blocks."""
-        step = 2 * np.pi * self.freq_hz / rate
-        block = np.sin(self._phase + step * np.arange(frames))
-        self._phase = (self._phase + step * frames) % (2 * np.pi)
-        return block
-
-
-class Looper:
-    """Records the message from the microphone and plays it back in a loop.
-
-    The stored clip is band-limited to MESSAGE_BW_HZ and normalised to a peak
-    of 1, so that the modulation index m means what the textbook says.
-    The unfiltered recording is kept too (same gain), for comparison.
-    """
-
-    def __init__(self):
-        # (message x(t), original recording, message at OVERSAMPLE× rate) — swapped
-        # in as one tuple so the audio thread never sees a half-updated set.
-        self._clip = None
-        self.pos = 0
-        self.lap = 0                # completed passes through the clip
-        self.recording = False
-        self._chunks = []
-        self._in_stream = None
-
-    def start_recording(self):
-        self._chunks = []
-        self._in_stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                         dtype="float32", callback=self._on_input)
-        self._in_stream.start()
-        self.recording = True
-
-    def _on_input(self, indata, frames, time_info, status):
-        self._chunks.append(indata[:, 0].copy())
-
-    def stop_recording(self):
-        """Stop capturing. Returns False if the take was silent (and discarded)."""
-        if self._in_stream is not None:
-            self._in_stream.stop()
-            self._in_stream.close()
-            self._in_stream = None
-        self.recording = False
-
-        clip = self.recorded_so_far().astype(np.float64)
-        if clip.size < 64:
-            return False
-        raw = clip - clip.mean()
-        lowpass = sps.butter(8, MESSAGE_BW_HZ, fs=SAMPLE_RATE, output="sos")
-        filtered = sps.sosfiltfilt(lowpass, raw)
-        peak = np.max(np.abs(filtered))
-        if peak <= 1e-3:
-            return False
-        # Same scale factor for both, so the only difference you hear is the filtering.
-        sample = (filtered / peak).astype(np.float32)
-        original = (raw / peak).astype(np.float32)
-        # Precompute the message at the receiver's oversampled rate (it's a loop,
-        # so this is done once rather than streamed).
-        sample_hi = sps.resample_poly(sample, OVERSAMPLE, 1).astype(np.float32)
-        self.pos = 0
-        self.lap = 0
-        self._clip = (sample, original, sample_hi)
-        return True
-
-    @property
-    def sample(self):
-        """The band-limited message x(t), or None."""
-        return None if self._clip is None else self._clip[0]
-
-    def clear(self):
-        self._clip = None
-        self.pos = 0
-
-    def recorded_so_far(self):
-        chunks = list(self._chunks)
-        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-
-    def render(self, frames):
-        """Next block of (message, original, lap number per sample, message at OVERSAMPLE×).
-
-        The lap number counts complete passes through the clip, so callers can
-        tell exactly which sample the loop wrapped on. The oversampled block
-        covers the same stretch of time and has frames * OVERSAMPLE samples.
-        """
-        clip = self._clip
-        if clip is None or self.recording:
-            silence = np.zeros(frames)
-            return silence, silence, np.full(frames, self.lap), np.zeros(frames * OVERSAMPLE)
-        sample, original, sample_hi = clip
-        n = len(sample)
-        ahead = self.pos + np.arange(frames)
-        ahead_hi = self.pos * OVERSAMPLE + np.arange(frames * OVERSAMPLE)
-        laps = self.lap + ahead // n
-        self.lap += (self.pos + frames) // n
-        self.pos = (self.pos + frames) % n
-        return (sample[ahead % n], original[ahead % n], laps,
-                sample_hi[ahead_hi % len(sample_hi)])
-
-
-class StreamFilter:
-    """An SOS filter that keeps its state between blocks (for streaming audio)."""
-
-    def __init__(self, sos):
-        self.sos = sos
-        self.zi = np.zeros((sos.shape[0], 2))
-
-    def __call__(self, block):
-        out, self.zi = sps.sosfilt(self.sos, block, zi=self.zi)
-        return out
-
-
-class EnvelopeDetector:
-    """Classic AM receiver: full-wave rectify, low-pass, block DC.
-
-    Takes the received signal at OVERSAMPLE × SAMPLE_RATE and returns each
-    stage at SAMPLE_RATE. Rectifying and low-passing at the high rate keeps the
-    carrier harmonics the rectifier creates (up to many × fc) from aliasing
-    into the audio before the low-pass removes them.
-
-    For a full-wave rectified sine the average is (2/pi)·amplitude, so the
-    low-passed output is scaled by pi/2 to recover the envelope 1 + m·x(t).
-    """
-
-    def __init__(self):
-        hi_rate = SAMPLE_RATE * OVERSAMPLE
-        # Stage 2: the detector's low-pass. 6th order so the 2fc ripple is
-        # well below audibility (≈ -70 dB at 16 kHz for fc = 8 kHz).
-        self._lp = StreamFilter(sps.butter(6, DETECTOR_BW_HZ, fs=hi_rate, output="sos"))
-        # Only for listening to / plotting stage 1 at 44.1 kHz: anti-alias before
-        # dropping samples, otherwise *that* display would be full of aliasing.
-        self._rect_aa = StreamFilter(sps.ellip(10, 0.1, 100, 20000, fs=hi_rate, output="sos"))
-        # Stage 3: DC block (a real radio uses a series capacitor).
-        self._hp = StreamFilter(sps.butter(1, 20.0, btype="highpass",
-                                           fs=SAMPLE_RATE, output="sos"))
-
-    def process(self, am_hi):
-        """Run one oversampled block through the receiver. Returns every stage at 44.1 kHz."""
-        rectified_hi = np.abs(am_hi)                                    # stage 1
-        lowpassed = self._lp(rectified_hi)[::OVERSAMPLE] * (np.pi / 2)  # stage 2
-        audio = self._hp(lowpassed)                                     # stage 3
-        rectified = self._rect_aa(rectified_hi)[::OVERSAMPLE]
-        return rectified, lowpassed, audio
-
-
-class Capture:
-    """Ring buffer of every signal the audio thread produced, for the plots to read."""
-
-    CHANNELS = ("carrier", "original", "message", "envelope", "am",
-                "rectified", "lowpassed", "demod", "out")
-
-    def __init__(self, size):
-        self.size = size
-        self.idx = 0
-        self.bufs = {name: np.zeros(size) for name in self.CHANNELS}
-
-    def write(self, **blocks):
-        n = len(next(iter(blocks.values())))
-        where = (self.idx + np.arange(n)) % self.size
-        for name, block in blocks.items():
-            self.bufs[name][where] = block
-        self.idx = (self.idx + n) % self.size
-
-    def last(self, name, n):
-        """The most recent n samples of a channel, oldest first."""
-        where = (self.idx - n + np.arange(n)) % self.size
-        return self.bufs[name][where]
-
-
-class Transmission:
-    """Wires carrier, message, modulator and receiver together for the audio thread."""
-
-    def __init__(self, carrier, looper):
-        self.carrier = carrier
-        self.looper = looper
-        self.detector = EnvelopeDetector()
-        self.capture = Capture(FFT_N)
-        self.m = START_M
-        self.listen = START_LISTEN
-        self.ab_playing = AB_SOURCES[0]     # which side of the A/B mode is sounding
-
-    def audio_out(self, outdata, frames, time_info, status):
-        # The transmitter runs at OVERSAMPLE × the audio rate so the receiver can
-        # rectify without aliasing. Everything we keep is at the audio rate; the
-        # AM signal itself is under 22 kHz, so taking every 8th sample is exact.
-        c_hi = self.carrier.render(frames * OVERSAMPLE, SAMPLE_RATE * OVERSAMPLE)
-        x, original, laps, x_hi = self.looper.render(frames)
-        am_hi = (1.0 + self.m * x_hi) * c_hi                # the transmitted signal
-        rectified, lowpassed, demod = self.detector.process(am_hi)   # receiver stages
-        c = c_hi[::OVERSAMPLE]
-        am = am_hi[::OVERSAMPLE]
-        envelope = 1.0 + self.m * x
-
-        if self.looper.recording:
-            out = np.zeros(frames)              # stay quiet so the mic hears only you
-        elif self.listen == AB_MODE:
-            # Even laps: the original recording, unfiltered, as captured.
-            # Odd laps: the receiver's final output (stage 4, exactly what
-            # "Demodulated" plays). Switches on the sample where the loop wraps.
-            out = np.where(laps % 2 == 0, original, demod)
-            self.ab_playing = AB_SOURCES[int(laps[-1] % 2)]
-        else:
-            out = {"AM signal": am, "Rectified": rectified, "Low-passed": lowpassed,
-                   "Demodulated": demod, "Message": x, "Original recording": original,
-                   "Carrier": c}[self.listen]
-
-        self.capture.write(carrier=c, original=original, message=x, envelope=envelope, am=am,
-                           rectified=rectified, lowpassed=lowpassed, demod=demod, out=out)
-        outdata[:, 0] = np.clip(OUTPUT_GAIN * out, -1.0, 1.0)
+THREAD_SWITCH_S = 0.0005    # Python's default (5 ms) lets drawing hold up the audio thread
+KM_STEPS = 1000         # resolution of the (logarithmic) distance slider
 
 
 class PipelineDiagram(QtWidgets.QWidget):
@@ -301,18 +71,22 @@ class PipelineDiagram(QtWidgets.QWidget):
     """
 
     # key, title, subtitle, listen mode, captured channel, y-range of the thumbnail
+    # (None = scale to fit, for signals whose level depends on distance)
     STAGES = [
-        ("mic", "Microphone", "original recording", "Original recording", "original", (-1.5, 1.5)),
+        ("mic", "Source", "original recording", "Original recording", "original", (-1.5, 1.5)),
         ("band", "Band-limit", f"low-pass {MESSAGE_BW_HZ / 1000:g} kHz → x(t)", "Message",
          "message", (-1.1, 1.1)),
-        ("mod", "Modulator", "s(t) = [1 + m·x(t)] · carrier", "AM signal", "am", (-2.4, 2.4)),
+        ("mod", "Modulator", "[1 + m·x(t)] · carrier", "AM signal", "am", (-2.4, 2.4)),
+        ("air", "Air", "all stations + noise", "On the air", "air", None),
+        ("tune", "Tuner", "band-pass around fc", "Tuned", "tuned", None),
+        ("agc", "AGC", "", "After AGC", "agc", (-2.4, 2.4)),
         ("rect", "Rectifier", "|s(t)|", "Rectified", "rectified", (-0.1, 2.4)),
-        ("lp", "Low-pass", f"{DETECTOR_BW_HZ / 1000:g} kHz, × π/2 → 1 + m·x", "Low-passed",
+        ("lp", "Low-pass", f"{DETECTOR_BW_HZ / 1000:g} kHz → 1 + m·x", "Low-passed",
          "lowpassed", (-0.1, 2.4)),
-        ("dc", "DC block", "→ recovered audio m·x(t)", "Demodulated", "demod", (-1.1, 1.1)),
+        ("dc", "DC block", "→ audio m·x(t)", "Demodulated", "demod", (-1.1, 1.1)),
         ("car", "Carrier oscillator", "", "Carrier", "carrier", (-1.2, 1.2)),
     ]
-    ROW = ["mic", "band", "mod", "rect", "lp", "dc"]   # left-to-right main chain
+    ROW = ["mic", "band", "mod", "air", "tune", "agc", "rect", "lp", "dc"]  # main chain
 
     BG = QtGui.QColor(0, 0, 0)
     BOX = QtGui.QColor(30, 30, 30)
@@ -337,7 +111,7 @@ class PipelineDiagram(QtWidgets.QWidget):
     # --- geometry ---
     def _layout(self):
         w = self.width()
-        margin, gap, top, box_h = 12, 34, 30, 110
+        margin, gap, top, box_h = 12, 24, 30, 110
         cols = len(self.ROW)
         box_w = (w - 2 * margin - gap * (cols - 1)) / cols
         self.rects = {}
@@ -394,7 +168,9 @@ class PipelineDiagram(QtWidgets.QWidget):
         n = max(int(self.view_s * SAMPLE_RATE), 2)
         data = self.tx.capture.last(channel, n)
         cols = max(int(rect.width()), 2)
-        edges = np.linspace(0, n, cols + 1).astype(int)
+        if yrange is None:
+            peak = max(np.abs(data).max() * 1.1, 1e-9)
+            yrange = (-peak, peak)
         lo, hi = yrange
         def y_of(v):
             return rect.bottom() - (np.clip(v, lo, hi) - lo) / (hi - lo) * rect.height()
@@ -402,15 +178,18 @@ class PipelineDiagram(QtWidgets.QWidget):
         if lo < 0 < hi:
             p.drawLine(QtCore.QPointF(rect.left(), y_of(0)), QtCore.QPointF(rect.right(), y_of(0)))
         p.setPen(QtGui.QPen(self.WAVE, 1))
-        prev = None
-        for i in range(cols):
-            seg = data[edges[i]:max(edges[i + 1], edges[i] + 1)]
-            x = rect.left() + i
-            y1, y2 = y_of(seg.min()), y_of(seg.max())
-            p.drawLine(QtCore.QPointF(x, y1), QtCore.QPointF(x, y2))
-            if prev is not None:       # join columns so sparse signals read as a line
-                p.drawLine(QtCore.QPointF(x - 1, prev), QtCore.QPointF(x, (y1 + y2) / 2))
-            prev = (y1 + y2) / 2
+        # One zigzag through every column's minimum and maximum, drawn in a single
+        # call: much faster than a line per pixel, and drawing competes with audio.
+        starts = np.linspace(0, n, cols, endpoint=False).astype(int)
+        ys = np.empty(2 * cols)
+        ys[0::2] = y_of(np.minimum.reduceat(data, starts))
+        ys[1::2] = y_of(np.maximum.reduceat(data, starts))
+        xs = rect.left() + np.repeat(np.arange(cols), 2)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        # Smoothing these dense lines is what costs the time, and it barely shows.
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        p.drawPath(pg.arrayToQPath(xs, ys))
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
     def paintEvent(self, event):
         self._layout()
@@ -425,8 +204,10 @@ class PipelineDiagram(QtWidgets.QWidget):
         title_font.setBold(True)
         small_font = QtGui.QFont(self.font())
         small_font.setPointSizeF(self.font().pointSizeF() * 0.85)
-        for label, keys in (("TRANSMITTER", ["mic", "band", "mod", "car"]),
-                            ("RECEIVER", ["rect", "lp", "dc"])):
+        ch = self.tx.channel
+        for label, keys in ((f"TRANSMITTER – CHANNEL {ch.number}", ["mic", "band", "mod", "car"]),
+                            (f"RECEIVER – TUNED TO CHANNEL {ch.number}",
+                             ["tune", "agc", "rect", "lp", "dc"])):
             box = r[keys[0]]
             for k in keys[1:]:
                 box = box.united(r[k])
@@ -447,18 +228,31 @@ class PipelineDiagram(QtWidgets.QWidget):
         car, mod = r["car"], r["mod"]
         self._arrow(p, QtCore.QPointF(car.center().x(), car.top()),
                     QtCore.QPointF(mod.center().x(), mod.bottom() + 1))
+        # What else is on the air.
+        air = r["air"]
+        others = QtCore.QRectF(air.left(), car.top(), air.width(), car.height())
+        self._arrow(p, QtCore.QPointF(air.center().x(), others.top()),
+                    QtCore.QPointF(air.center().x(), air.bottom() + 1))
+        p.setPen(QtGui.QPen(self.EDGE, 1, QtCore.Qt.PenStyle.DashLine))
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(others, 6, 6)
+        lines = [f"CH {c.number}: " + (f"{c.carrier.freq_hz / 1000:g} kHz, {c.distance_km:.3g} km"
+                                       if c.on_air else "off air")
+                 for c in self.tx.channels if c is not ch]
+        lines.append(f"Weather: {self.tx.atmosphere.weather:.0%}")
         p.setPen(self.DIM)
         p.setFont(small_font)
-        gap_mid = (r["mod"].right() + r["rect"].left()) / 2
-        p.drawText(QtCore.QRectF(gap_mid - 40, r["mod"].center().y() - 26, 80, 18),
-                   QtCore.Qt.AlignmentFlag.AlignCenter, "s(t)")
+        p.drawText(others.adjusted(8, 4, -4, -4), QtCore.Qt.AlignmentFlag.AlignVCenter,
+                   "\n".join(lines))
 
         # Blocks.
         solid, outlined = self._playing_keys()
         for key, title, subtitle, mode, channel, yrange in self.STAGES:
             rect = r[key]
             if key == "car":
-                subtitle = f"fc = {self.tx.carrier.freq_hz:g} Hz"
+                subtitle = f"fc = {ch.carrier.freq_hz:g} Hz"
+            elif key == "agc":
+                subtitle = f"gain {self.tx.agc.gain_db:+d} dB"
             if key in solid:
                 edge = QtGui.QPen(self.PLAYING, 3)
             elif key in outlined:
@@ -507,57 +301,93 @@ class MainWindow(QtWidgets.QWidget):
         self.setWindowTitle("FMSim – AM transmission")
         self.resize(1600, 1150)
 
-        # --- controls row ---
+        # --- controls: one box for the chosen channel, one for everything else ---
+        self.channel_btns = QtWidgets.QButtonGroup(self)
+        selector = QtWidgets.QHBoxLayout()
+        selector.setSpacing(0)
+        for i, ch in enumerate(tx.channels):
+            btn = QtWidgets.QPushButton(f"CH {ch.number}")
+            btn.setCheckable(True)
+            btn.setMinimumHeight(34)
+            btn.setStyleSheet("QPushButton:checked { background: #ffdc00; color: black; "
+                              "font-weight: bold; }")
+            btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            self.channel_btns.addButton(btn, i)
+            selector.addWidget(btn)
+        self.channel_btns.button(tx.selected).setChecked(True)
+        self.channel_btns.idClicked.connect(self.select_channel)
+
         self.record_btn = QtWidgets.QPushButton("● Record")
         self.stop_btn = QtWidgets.QPushButton("■ Stop")
+        self.open_btn = QtWidgets.QPushButton("Open WAV…")
         self.clear_btn = QtWidgets.QPushButton("Clear")
-
-        self.m_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.m_slider.setRange(0, 150)
-        self.m_slider.setValue(int(START_M * 100))
-        self.m_slider.setFixedWidth(180)
-        self.m_label = QtWidgets.QLabel()
+        self.air_box = QtWidgets.QCheckBox("On air")
+        self.fc_label = QtWidgets.QLabel()
+        self.m_slider, self.m_label = self.make_slider(150, 130, 60)
+        self.km_slider, self.km_label = self.make_slider(KM_STEPS, 150, 60)
+        self.sky_slider, self.sky_label = self.make_slider(100, 130, 80)
+        self.weather_slider, self.weather_label = self.make_slider(100, 150, 120)
 
         self.listen_box = QtWidgets.QComboBox()
         self.listen_box.addItems(LISTEN_MODES)
         self.listen_box.setCurrentText(tx.listen)
+        self.view_box = QtWidgets.QComboBox()
+        self.view_box.addItems([f"{ms} ms" for ms in RECEIVER_VIEWS_MS])
+        self.view_box.setCurrentIndex(RECEIVER_VIEWS_MS.index(START_RECEIVER_VIEW_MS))
 
         self.status = QtWidgets.QLabel()
+        self.readout = QtWidgets.QLabel()
         self.warning = QtWidgets.QLabel()
         self.warning.setStyleSheet("color: #ff6060; font-weight: bold;")
+        self.warning.setWordWrap(True)
 
-        for w in (self.record_btn, self.stop_btn, self.clear_btn,
-                  self.m_slider, self.listen_box):
+        for w in (self.record_btn, self.stop_btn, self.open_btn, self.clear_btn, self.air_box,
+                  self.listen_box, self.view_box):
             # Keep keyboard focus off the controls so arrow keys stay free.
             w.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
 
         self.record_btn.clicked.connect(self.on_record)
         self.stop_btn.clicked.connect(self.on_stop)
+        self.open_btn.clicked.connect(self.on_open)
         self.clear_btn.clicked.connect(self.on_clear)
+        self.air_box.toggled.connect(self.on_air_toggled)
         self.m_slider.valueChanged.connect(self.on_m_changed)
+        self.km_slider.valueChanged.connect(self.on_km_changed)
+        self.sky_slider.valueChanged.connect(self.on_sky_changed)
+        self.weather_slider.valueChanged.connect(self.on_weather_changed)
         self.listen_box.currentTextChanged.connect(self.on_listen_changed)
-
-        controls = QtWidgets.QHBoxLayout()
-        for w in (self.record_btn, self.stop_btn, self.clear_btn):
-            controls.addWidget(w)
-        controls.addSpacing(20)
-        controls.addWidget(QtWidgets.QLabel("Modulation index"))
-        controls.addWidget(self.m_slider)
-        controls.addWidget(self.m_label)
-        controls.addSpacing(20)
-        controls.addWidget(QtWidgets.QLabel("Listen:"))
-        controls.addWidget(self.listen_box)
-        controls.addSpacing(20)
-        controls.addWidget(self.status, stretch=1)
-
-        self.view_box = QtWidgets.QComboBox()
-        self.view_box.addItems([f"{ms} ms" for ms in RECEIVER_VIEWS_MS])
-        self.view_box.setCurrentIndex(RECEIVER_VIEWS_MS.index(START_RECEIVER_VIEW_MS))
-        self.view_box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.view_box.currentIndexChanged.connect(self.on_view_changed)
-        controls.insertWidget(controls.count() - 2, QtWidgets.QLabel("Receiver view:"))
-        controls.insertWidget(controls.count() - 2, self.view_box)
-        controls.insertSpacing(controls.count() - 2, 20)
+
+        def row(*items):
+            """Widgets in a line; a string becomes a label, a number becomes a gap."""
+            line = QtWidgets.QHBoxLayout()
+            for item in items:
+                if isinstance(item, int):
+                    line.addSpacing(item)
+                else:
+                    line.addWidget(QtWidgets.QLabel(item) if isinstance(item, str) else item)
+            line.addStretch(1)
+            return line
+
+        self.channel_group = QtWidgets.QGroupBox()
+        box = QtWidgets.QVBoxLayout(self.channel_group)
+        box.addLayout(row(self.record_btn, self.stop_btn, self.open_btn, self.clear_btn, 12,
+                          self.air_box, 12, self.fc_label))
+        box.addLayout(row("Modulation", self.m_slider, self.m_label, 8,
+                          "Distance", self.km_slider, self.km_label, 8,
+                          "Skywave", self.sky_slider, self.sky_label))
+        shared = QtWidgets.QGroupBox("Shared – all channels")
+        box = QtWidgets.QVBoxLayout(shared)
+        box.addLayout(row("Listen:", self.listen_box, 12, "Receiver view:", self.view_box))
+        box.addLayout(row("Weather", self.weather_slider, self.weather_label))
+        controls = QtWidgets.QHBoxLayout()
+        controls.addLayout(selector)
+        controls.addSpacing(8)
+        controls.addWidget(self.channel_group, stretch=3)
+        controls.addWidget(shared, stretch=2)
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.addWidget(self.status, stretch=1)
+        status_row.addWidget(self.readout)
 
         # --- plots ---
         # Top row: the source signals and the spectrum.
@@ -570,7 +400,7 @@ class MainWindow(QtWidgets.QWidget):
         self.carrier_plot.setYRange(-1.2, 1.2)
         self.carrier_curve = self.carrier_plot.plot(pen=pg.mkPen("y", width=2))
 
-        self.msg_plot = make_plot(top, 0, 1, "Message x(t): voice sample, "
+        self.msg_plot = make_plot(top, 0, 1, "Message x(t): source audio, "
                                   f"low-passed to {MESSAGE_BW_HZ / 1000:g} kHz",
                                   "Time", "s", "x(t)")
         self.msg_curve = self.msg_plot.plot(pen=pg.mkPen("c", width=1))
@@ -583,10 +413,19 @@ class MainWindow(QtWidgets.QWidget):
         self.spec_plot = make_plot(top, 0, 2, "", "Frequency", "Hz", "Level (dB)")
         self.spec_plot.setXRange(0, SAMPLE_RATE / 2, padding=0)
         self.spec_plot.setYRange(-100, 5)
+        # The part of the spectrum the tuner lets through, and everything on the air.
+        self.tuned_band = pg.LinearRegionItem(movable=False, brush=(255, 220, 0, 30),
+                                              pen=pg.mkPen(None))
+        self.spec_plot.addItem(self.tuned_band)
+        self.spec_air = self.spec_plot.plot(pen=pg.mkPen((150, 150, 150), width=1))
         self.spec_msg = self.spec_plot.plot(pen=pg.mkPen("c", width=1))
         self.spec_sel = self.spec_plot.plot(pen=pg.mkPen("y", width=1))
-        self.fc_line = pg.InfiniteLine(angle=90, pen=pg.mkPen((255, 255, 255, 80)))
-        self.spec_plot.addItem(self.fc_line)
+        self.fc_lines = []
+        for ch in tx.channels:
+            line = pg.InfiniteLine(angle=90, pen=pg.mkPen((255, 255, 255, 80)),
+                                   label=f"CH {ch.number}", labelOpts={"position": 0.95})
+            self.spec_plot.addItem(line)
+            self.fc_lines.append(line)
         self.spec_plot.addItem(pg.InfiniteLine(
             pos=DETECTOR_BW_HZ, angle=90,
             pen=pg.mkPen("g", width=1, style=QtCore.Qt.PenStyle.DashLine)))
@@ -595,14 +434,15 @@ class MainWindow(QtWidgets.QWidget):
         self.window_gain = self.window.sum() / 2   # so a unit sine reads 0 dB
         self.spec_msg_db = np.full(len(self.freqs), -120.0)
         self.spec_sel_db = np.full(len(self.freqs), -120.0)
+        self.spec_air_db = np.full(len(self.freqs), -120.0)
 
         # Receiver stages. Each plot shows a stage's output (yellow) and, dashed in
         # red, what that stage *should* produce in theory, so you can compare.
         ref_pen = pg.mkPen("r", width=2, style=QtCore.Qt.PenStyle.DashLine)
         stage_specs = [
             # (title, ylabel, y-range, channel)
-            ("① Received s(t)<br><small>red: envelope ±[1 + m·x]</small>",
-             "s(t)", (-2.6, 2.6), "am"),
+            ("① Tuned + AGC = s(t)<br><small>red: ideal envelope ±[1 + m·x]</small>",
+             "s(t)", (-2.6, 2.6), "agc"),
             ("② Rectified |s(t)|<br><small>red: its average (2/π)·[1 + m·x]</small>",
              "|s(t)|", (-0.1, 2.6), "rectified"),
             (f"③ Low-passed ({DETECTOR_BW_HZ / 1000:g} kHz) × π/2<br>"
@@ -628,6 +468,7 @@ class MainWindow(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(controls)
+        layout.addLayout(status_row)
         layout.addWidget(self.warning)
         layout.addWidget(self.diagram)
         layout.addWidget(g, stretch=1)
@@ -637,18 +478,66 @@ class MainWindow(QtWidgets.QWidget):
                             ("Shift+Up", 10), ("Shift+Down", -10),
                             ("PgUp", 1000), ("PgDown", -1000)):
             sc = QShortcut(QtGui.QKeySequence(keys), self)
-            sc.activated.connect(lambda d=delta: self.tx.carrier.nudge(d))
+            sc.activated.connect(lambda d=delta: self.tx.channel.carrier.nudge(d))
+        for i in range(len(tx.channels)):
+            sc = QShortcut(QtGui.QKeySequence(str(i + 1)), self)
+            sc.activated.connect(lambda i=i: self.select_channel(i))
 
-        self.message = ""           # error / info text shown when there's no sample
+        self.messages = [""] * len(tx.channels)  # per channel: error / info in the status line
         self.plot_phase = 0.0
         self.last_t = time.perf_counter()
-        self.on_m_changed(self.m_slider.value())
-        self.refresh_controls()
+        self.on_weather_changed(self.weather_slider.value())
+        self.select_channel(tx.selected)
+
+    @staticmethod
+    def make_slider(top, width, label_width):
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(0, top)
+        slider.setFixedWidth(width)
+        slider.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        label = QtWidgets.QLabel()
+        label.setMinimumWidth(label_width)      # so the row doesn't shift as the text changes
+        return slider, label
+
+    @property
+    def message(self):
+        return self.messages[self.tx.selected]
+
+    @message.setter
+    def message(self, text):
+        self.messages[self.tx.selected] = text
 
     # --- control handlers ---
+    def select_channel(self, index):
+        """Point the channel controls and the receiver at a station."""
+        if self.tx.recording:       # the recording belongs to the current channel
+            return
+        self.tx.selected = index
+        ch = self.tx.channel
+        self.channel_btns.button(index).setChecked(True)
+        self.channel_group.setTitle(f"Channel {ch.number}")
+        km_pos = KM_STEPS * np.log(ch.distance_km / MIN_KM) / np.log(MAX_KM / MIN_KM)
+        for slider, value in ((self.m_slider, ch.m * 100), (self.km_slider, km_pos),
+                              (self.sky_slider, ch.skywave * 100)):
+            # Show the channel's settings without writing (rounded) values back to it.
+            slider.blockSignals(True)
+            slider.setValue(round(value))
+            slider.blockSignals(False)
+        self.show_channel_labels()
+        self.show_sample()
+        self.refresh_controls()
+
+    def show_channel_labels(self):
+        ch = self.tx.channel
+        self.m_label.setText(f"m = {ch.m:.2f}")
+        km = ch.distance_km
+        self.km_label.setText(f"{km:.1f} km" if km < 10 else f"{km:.0f} km")
+        self.sky_label.setText("day" if ch.skywave == 0 else
+                               "night" if ch.skywave == 1 else f"{ch.skywave:.0%} night")
+
     def on_record(self):
         try:
-            self.tx.looper.start_recording()
+            self.tx.channel.looper.start_recording()
         except Exception as exc:  # e.g. no microphone available
             self.message = f"Could not open microphone: {exc}"
             return
@@ -657,22 +546,64 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_controls()
 
     def on_stop(self):
-        if self.tx.looper.stop_recording():
+        if self.tx.channel.looper.stop_recording():
             self.message = ""
+            self.tx.channel.on_air = True
         else:
             self.message = "Recording was silent – check the mic isn't muted"
         self.show_sample()
         self.refresh_controls()
 
+    def on_open(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open message", "", "WAV files (*.wav);;All files (*)")
+        if path:
+            self.open_wav(path)
+
+    def open_wav(self, path):
+        name = os.path.basename(path)
+        try:
+            clip, truncated = load_wav(path)
+        except Exception as exc:  # missing, unreadable or not a WAV file
+            self.message = f"Could not open {name}: {exc}"
+            return
+        if not self.tx.channel.looper.set_clip(clip):
+            self.message = f"{name} is silent or too short"
+        else:
+            self.message = name
+            self.tx.channel.on_air = True
+            if truncated:
+                self.message += f", first {MAX_WAV_S:g} s only"
+        self.show_sample()
+        self.refresh_controls()
+
     def on_clear(self):
-        self.tx.looper.clear()
-        self.msg_curve.setData([], [])
-        self.playhead.hide()
+        self.tx.channel.looper.clear()
+        self.message = ""
+        self.show_sample()
         self.refresh_controls()
 
     def on_m_changed(self, value):
-        self.tx.m = value / 100
-        self.m_label.setText(f"m = {self.tx.m:.2f}")
+        self.tx.channel.m = value / 100
+        self.show_channel_labels()
+
+    def on_km_changed(self, value):
+        # Logarithmic: equal slider steps multiply the distance equally.
+        self.tx.channel.distance_km = MIN_KM * (MAX_KM / MIN_KM) ** (value / KM_STEPS)
+        self.show_channel_labels()
+
+    def on_sky_changed(self, value):
+        self.tx.channel.skywave = value / 100
+        self.show_channel_labels()
+
+    def on_weather_changed(self, value):
+        self.tx.atmosphere.weather = value / 100
+        names = ("unsettled", "stormy", "thunderstorm")
+        name = "clear" if value == 0 else names[min(value // 34, 2)]
+        self.weather_label.setText(f"{value}% {name}")
+
+    def on_air_toggled(self, on):
+        self.tx.channel.on_air = on
 
     def on_listen_changed(self, mode):
         self.tx.listen = mode
@@ -683,15 +614,20 @@ class MainWindow(QtWidgets.QWidget):
         self.diagram.view_s = self.view_s
 
     def refresh_controls(self):
-        looper = self.tx.looper
+        looper = self.tx.channel.looper
         self.record_btn.setEnabled(not looper.recording)
         self.stop_btn.setEnabled(looper.recording)
+        self.open_btn.setEnabled(not looper.recording)
         self.clear_btn.setEnabled(not looper.recording and looper.sample is not None)
+        for btn in self.channel_btns.buttons():
+            btn.setEnabled(not looper.recording)
+        self.air_box.setChecked(self.tx.channel.on_air)
 
     def show_sample(self):
-        sample = self.tx.looper.sample
+        sample = self.tx.channel.looper.sample
         if sample is None:
             self.msg_curve.setData([], [])
+            self.playhead.hide()
             return
         t = np.arange(len(sample)) / SAMPLE_RATE
         self.msg_curve.setData(t, sample)
@@ -704,8 +640,9 @@ class MainWindow(QtWidgets.QWidget):
         now = time.perf_counter()
         dt = (now - self.last_t) * SLOWMO
         self.last_t = now
-        fc = self.tx.carrier.freq_hz
-        looper = self.tx.looper
+        ch = self.tx.channel
+        fc = ch.carrier.freq_hz
+        looper = ch.looper
 
         # Carrier (slow motion so you can see it move).
         self.plot_phase = (self.plot_phase + 2 * np.pi * fc * dt) % (2 * np.pi)
@@ -726,22 +663,35 @@ class MainWindow(QtWidgets.QWidget):
                 self.on_stop()
         elif looper.sample is not None:
             self.playhead.setPos(looper.pos / SAMPLE_RATE)
-            text = f"Transmitting {len(looper.sample) / SAMPLE_RATE:.1f} s message"
+            text = "Transmitting" if ch.on_air else "Off air:"
+            text += f" {len(looper.sample) / SAMPLE_RATE:.1f} s message"
+            if self.message:
+                text += f" ({self.message})"
             if self.tx.listen == AB_MODE:
                 text += f"   ▶ now playing: {self.tx.ab_playing.upper()}"
             self.status.setText(text)
         else:
-            self.status.setText(self.message or "No message – press Record (carrier only)")
+            self.status.setText(self.message or "No message – press Record or Open WAV"
+                                + (" (carrier only)" if ch.on_air else " (off air)"))
+
+        self.fc_label.setText(f"fc = {fc:g} Hz  (↑↓ keys)")
+        snr = self.tx.snr_db
+        self.readout.setText(
+            ("Signal / noise: station is off air" if snr is None else
+             f"Signal / (noise + other stations): {snr:.0f} dB")
+            + f"     AGC gain: {self.tx.agc.gain_db:+d} dB")
 
         # Receiver stages: the last few ms that actually went through the receiver.
         cap = self.tx.capture
         n = int(self.view_s * SAMPLE_RATE)
         t = (np.arange(n) - n) / SAMPLE_RATE
-        env = cap.last("envelope", n)
-        theory = {"am": (env, -env),
-                  "rectified": (2 / np.pi * env,),
-                  "lowpassed": (env,),
-                  "demod": (self.tx.m * cap.last("message", n),)}
+        # The theory curves come from the transmitter, so shift each by the receiver's
+        # filter delay up to that stage.
+        env = {c: cap.last("envelope", n, d) for c, d in self.tx.delays.items()}
+        theory = {"agc": (env["agc"], -env["agc"]),
+                  "rectified": (2 / np.pi * env["rectified"],),
+                  "lowpassed": (env["lowpassed"],),
+                  "demod": (cap.last("mx", n, self.tx.delays["demod"]),)}
         for _, channel, curve, refs in self.stages:
             curve.setData(t, cap.last(channel, n))
             for ref, y in zip(refs, theory[channel]):
@@ -749,24 +699,29 @@ class MainWindow(QtWidgets.QWidget):
 
         # Spectrum of the message vs whatever you're listening to (smoothed a little).
         listen = self.tx.listen
-        for channel, store, curve in (("message", self.spec_msg_db, self.spec_msg),
+        for channel, store, curve in (("air", self.spec_air_db, self.spec_air),
+                                      ("message", self.spec_msg_db, self.spec_msg),
                                       (LISTEN_CHANNEL[listen], self.spec_sel_db, self.spec_sel)):
             mag = np.abs(np.fft.rfft(cap.last(channel, FFT_N) * self.window)) / self.window_gain
             db = 20 * np.log10(mag + 1e-6)
             store[:] = 0.7 * store + 0.3 * db
             curve.setData(self.freqs, store)
-        self.spec_plot.setTitle(f"Spectrum: message (cyan) vs {listen} (yellow)<br>"
-                                f"<small>white: fc &nbsp; green: detector's "
+        self.spec_plot.setTitle(f"Spectrum: message (cyan), {listen} (yellow), air (grey)<br>"
+                                f"<small>shaded: tuner passband &nbsp; green: detector's "
                                 f"{DETECTOR_BW_HZ / 1000:g} kHz low-pass cutoff</small>")
-        self.fc_line.setPos(fc)
+        for c, line in zip(self.tx.channels, self.fc_lines):
+            line.setPos(c.carrier.freq_hz)
+            line.setVisible(c.on_air or c is ch)
+        self.tuned_band.setRegion((fc - MESSAGE_BW_HZ, fc + MESSAGE_BW_HZ))
 
         self.warning.setText(self.warnings(fc))
         self.diagram.update()
 
     def warnings(self, fc):
         msgs = []
-        if self.tx.m > 1.0:
-            msgs.append(f"Overmodulated (m = {self.tx.m:.2f} > 1): the envelope crosses "
+        ch = self.tx.channel
+        if ch.m > 1.0:
+            msgs.append(f"Overmodulated (m = {ch.m:.2f} > 1): the envelope crosses "
                         "zero, so the envelope detector distorts.")
         if fc <= MESSAGE_BW_HZ:
             msgs.append(f"Carrier ({fc:g} Hz) is at or below the message bandwidth "
@@ -777,6 +732,12 @@ class MainWindow(QtWidgets.QWidget):
             # 2fc - bandwidth; it needs to be well above the detector's cutoff.
             msgs.append("Carrier is close to the message bandwidth: carrier ripple leaks "
                         "through the detector's low-pass filter.")
+        for other in self.tx.channels:
+            spacing = abs(other.carrier.freq_hz - fc)
+            if other is not ch and other.on_air and ch.on_air and spacing < 2 * MESSAGE_BW_HZ:
+                msgs.append(f"Channel {other.number} is only {spacing:g} Hz away: stations need "
+                            f"{2 * MESSAGE_BW_HZ:g} Hz, so their sidebands overlap and the "
+                            "tuner can't separate them.")
         return "   ".join(msgs)
 
 
@@ -792,10 +753,15 @@ def find_output_device():
 
 
 def main():
+    sys.setswitchinterval(THREAD_SWITCH_S)
     pg.mkQApp("FMSim")
-    tx = Transmission(Carrier(START_FC_HZ), Looper())
+    tx = Transmission()
     win = MainWindow(tx)
     win.show()
+    for i, path in enumerate(sys.argv[1:][:len(tx.channels)]):
+        win.select_channel(i)
+        win.open_wav(path)
+    win.select_channel(0)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(win.tick)
@@ -808,8 +774,9 @@ def main():
                          dtype="float32", callback=tx.audio_out):
         pg.exec()
 
-    if tx.looper.recording:
-        tx.looper.stop_recording()
+    for ch in tx.channels:
+        if ch.looper.recording:
+            ch.looper.stop_recording()
 
 
 if __name__ == "__main__":
