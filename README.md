@@ -4,12 +4,12 @@ An interactive AM (amplitude modulation) radio simulator. Put up to three statio
 receiver to one of them, and see and hear the signal at every step from the
 original recording to the recovered audio.
 
-![AMSim with a WAV file on channel 1 and another on channel 2](docs/screenshot.png)
+![AMSim at launch, with three stations on the air and the receiver tuned to channel 3](docs/screenshot.png)
 
-*An example with two WAV files on the air, on channel 1 (5.5 kHz) and channel 2
-(11.75 kHz). The receiver is tuned to channel 1 and is playing the demodulated audio. Both stations
-are visible in the spectrum at the upper right; the shaded band is what the tuner
-lets through.*
+*AMSim as it starts, with the three sample recordings on the air on channel 1
+(5.9 kHz), channel 2 (11.75 kHz) and channel 3 (18 kHz). The receiver is tuned to
+channel 3 and is playing the demodulated audio. All three stations are visible in the
+spectrum at the upper right; the shaded band is what the tuner lets through.*
 
 ## Getting started
 
@@ -111,11 +111,12 @@ keyboard:
    the recovered audio in turn.
 2. **Overmodulate.** Raise **Modulation** above 1 and watch the envelope in plot ①
    cross zero.
-3. **Drown out a weak station.** Put channel 1 at 500 km and leave channel 2 at
-   1 km. The AGC turns up the weak signal, along with the noise and whatever leaks
-   in from channel 2.
-4. **Make stations collide.** Move one carrier to within 6 kHz of another. Their
-   sidebands overlap and the tuner can't separate them.
+3. **Drown out a weak station.** Put channel 1 at 500 km and channel 2 at 1 km. The
+   AGC turns up the weak signal, along with the noise and whatever leaks in from
+   channel 2.
+4. **Make stations collide.** Channels 1 and 2 already overlap slightly at launch.
+   Move their carriers closer together and the tuner can't separate them. Move channel
+   1 down to 5.5 kHz to clear the overlap.
 5. **Listen through a storm.** Raise **Weather**, then add **Skywave** for
    night-time fading.
 
