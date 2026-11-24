@@ -15,7 +15,7 @@ You need Python 3 and an audio output device. A microphone is only needed for
 recording.
 
 ```
-pip install numpy scipy sounddevice pyqtgraph PyQt6
+pip install -r requirements.txt
 python main.py
 ```
 
@@ -32,8 +32,7 @@ channel 3 (channel 1 if you give your own files). Click the **Source** block (or
 choose **Original recording** under **Listen**) to hear the source audio directly.
 
 The stations start at different distances, with some skywave fading and 20 % weather.
-To change the launch settings, edit `START_CHANNELS` and the other `START_` values in
-`main.py`.
+To change the launch settings, edit `LAUNCH` in `amsim/settings.py`.
 
 ## How it works
 
@@ -139,14 +138,57 @@ python capture.py --no-mic music.wav # without the microphone
 
 Use headphones to keep the microphone from picking up the PC's own sound.
 
-## Files
+## Reading the code
+
+Start with `Simulation._simulate` in `amsim/simulation.py`: it is the whole chain, from
+the messages to the recovered audio, in one page. Each thing it calls has its own file.
 
 | File | Contents |
 |---|---|
-| `main.py` | The user interface |
-| `dsp.py` | The signal processing, with no GUI code |
-| `capture.py` | The PC audio recorder |
-| `test_dsp.py` | Tests for `dsp.py` |
+| `main.py` | Starts the app |
+| `amsim/settings.py` | Shared constants, and the settings the app starts with |
+| `amsim/stages.py` | The stages of the chain: drives the block diagram and the Listen menu |
+| `amsim/simulation.py` | Connects the stations, the air and the receiver |
+| `amsim/station.py` | A station: carrier, modulator, distance and skywave fading |
+| `amsim/message.py` | Loading, recording and looping a message |
+| `amsim/atmosphere.py` | Receiver noise, static and lightning |
+| `amsim/receiver.py` | Tuner, AGC and envelope detector |
+| `amsim/filters.py` | Filters and ramps that work block by block |
+| `amsim/ui/main_window.py` | The window: creates the parts below and connects them |
+| `amsim/ui/controls.py` | Buttons, sliders and menus |
+| `amsim/ui/status.py` | The status, reading and warning texts |
+| `amsim/ui/diagram.py` | The block diagram |
+| `amsim/ui/plots.py` | The plots |
+| `capture.py` | The PC audio recorder, a separate program |
+| `tests/` | The tests |
+
+The audio is made in one thread and drawn in another. The rules for that are in the
+docstring of `Simulation`.
+
+### Adding a receiver stage
+
+1. Write the stage in `amsim/receiver.py` and call it in `Simulation._simulate`.
+2. Add its output to `signals` there, and its name to `Capture.SIGNALS`.
+3. Add a `Stage` to `STAGES` in `amsim/stages.py`, and its key to `MAIN_CHAIN`,
+   `RECEIVER` and `_MENU_ORDER`. It is then in the diagram and the Listen menu.
+
+### Glossary
+
+| Term | Meaning |
+|---|---|
+| **Station** | One transmitter. The window calls it a channel |
+| **Message**, *x(t)* | The audio a station transmits |
+| **Carrier**, *fc* | The sine wave that carries the message, and its frequency |
+| **Modulation index**, *m* | How strongly the message changes the carrier's amplitude |
+| **Envelope** | The outline of the modulated carrier, `1 + m·x(t)` |
+| **Sidebands** | The copies of the message's spectrum just above and below the carrier |
+| **Signal** | One of the waveforms along the chain, such as `am` or `demod` |
+| **Block** | The few hundred samples the audio thread makes at a time |
+| **AGC** | Automatic gain control: makes near and far stations equally loud |
+| **Envelope detector** | Recovers the message: rectifier, low-pass and DC block |
+| **SNR** | Signal-to-noise ratio: the wanted station's power over everything else's |
+| **Skywave** | A second copy of a station's signal, reflected by the ionosphere |
+| **Oversampling** | Running the detector at 8 × the sample rate, so it adds no false tones |
 
 Run the tests with:
 
