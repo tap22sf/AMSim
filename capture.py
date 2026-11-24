@@ -95,96 +95,154 @@ class Mic:
         return out
 
 
-def record(filename, seconds=None, use_mic=True):
-    """Record to filename until `seconds` have been captured, or until Ctrl+C."""
-    blocks = queue.Queue()
+class PcAudio:
+    """What the PC is playing, as stereo blocks (WASAPI loopback of the default output)."""
 
-    def on_input(data, frame_count, time_info, status):
-        blocks.put(data)
+    def __init__(self, audio):
+        self._audio = audio         # a pyaudio.PyAudio
+        self._speaker = audio.get_default_wasapi_device(d_out=True)
+        self._loopback = audio.get_wasapi_loopback_analogue_by_dict(self._speaker)
+        self._channels = self._loopback["maxInputChannels"]
+        self._blocks = queue.Queue()
+        self._streams = contextlib.ExitStack()
+        self.name = self._speaker["name"]
+        self.rate = int(self._loopback["defaultSampleRate"])
+
+    def __enter__(self):
+        with contextlib.ExitStack() as streams:
+            # Loopback delivers nothing while the PC is silent, which would cut gaps
+            # out of the recording. Playing silence keeps the data flowing.
+            streams.enter_context(self._audio.open(
+                format=pyaudio.paFloat32, channels=self._speaker["maxOutputChannels"],
+                rate=self.rate, output=True, output_device_index=self._speaker["index"],
+                frames_per_buffer=BLOCK, stream_callback=self._play_silence))
+            streams.enter_context(self._audio.open(
+                format=pyaudio.paFloat32, channels=self._channels, rate=self.rate,
+                input=True, input_device_index=self._loopback["index"],
+                frames_per_buffer=BLOCK, stream_callback=self._on_input))
+            self._streams = streams.pop_all()   # both opened: keep them open
+        return self
+
+    def __exit__(self, *exc):
+        self._streams.close()
+
+    def _play_silence(self, data, frame_count, time_info, status):
+        return bytes(frame_count * self._speaker["maxOutputChannels"] * 4), pyaudio.paContinue
+
+    def _on_input(self, data, frame_count, time_info, status):
+        self._blocks.put(data)
         return None, pyaudio.paContinue
 
-    def play_silence(data, frame_count, time_info, status):
-        return bytes(frame_count * speaker["maxOutputChannels"] * 4), pyaudio.paContinue
+    def discard(self):
+        """Throw away everything that has arrived so far."""
+        while not self._blocks.empty():
+            self._blocks.get()
 
-    with pyaudio.PyAudio() as p:
-        speaker = p.get_default_wasapi_device(d_out=True)
-        loopback = p.get_wasapi_loopback_analogue_by_dict(speaker)
-        channels = loopback["maxInputChannels"]
-        rate = int(loopback["defaultSampleRate"])
-        limit = None if seconds is None else int(seconds * rate)
-        slack = int(SYNC_SLACK_S * rate)
-        frames = clipped = 0
-        pc_peak = mic_peak = 0.0
-        pending = np.zeros((0, 2), dtype=np.float32)    # PC audio waiting for its mic audio
+    def read(self):
+        """The next stereo block. Raises queue.Empty if the device stops delivering."""
+        data = self._blocks.get(timeout=NO_AUDIO_TIMEOUT_S)
+        return to_stereo(np.frombuffer(data, dtype=np.float32).reshape(-1, self._channels))
 
-        # Loopback delivers nothing while the PC is silent, which would cut gaps
-        # out of the recording. Playing silence keeps the data flowing.
-        with (p.open(format=pyaudio.paFloat32, channels=speaker["maxOutputChannels"],
-                     rate=rate, output=True, output_device_index=speaker["index"],
-                     frames_per_buffer=BLOCK, stream_callback=play_silence),
-              p.open(format=pyaudio.paFloat32, channels=channels, rate=rate,
-                     input=True, input_device_index=loopback["index"],
-                     frames_per_buffer=BLOCK, stream_callback=on_input),
-              (Mic(rate) if use_mic else contextlib.nullcontext()) as mic):
 
+class Mixer:
+    """Adds the microphone (if any) to the PC audio, keeping the two in step."""
+
+    def __init__(self, mic, rate):
+        self._mic = mic
+        self._slack = int(SYNC_SLACK_S * rate)
+        self._pending = np.zeros((0, 2), dtype=np.float32)  # PC audio waiting for its mic audio
+        self.frames = 0             # mixed so far
+        self.clipped = 0
+        self.pc_peak = 0.0
+        self.mic_peak = 0.0
+
+    def mix(self, block, limit=None):
+        """Take in a block of PC audio and return what is ready, at most `limit` frames."""
+        self._pending = np.concatenate((self._pending, block))
+        ready = self._frames_ready()
+        if limit is not None:
+            ready = min(ready, limit)
+        mix, self._pending = self._pending[:ready], self._pending[ready:]
+        if ready == 0:
+            return mix
+        self.pc_peak = max(self.pc_peak, float(np.abs(mix).max()))
+        if self._mic:
+            voice = self._mic.read(ready)
+            self.mic_peak = max(self.mic_peak, float(np.abs(voice).max()))
+            mix = mix + voice[:, np.newaxis]
+        self.clipped += int((np.abs(mix) > 1.0).any(axis=1).sum())
+        self.frames += ready
+        return mix
+
+    def _frames_ready(self):
+        waiting = len(self._pending)
+        if not self._mic:
+            return waiting
+        # The two devices' clocks differ slightly. Wait for the mic if it is a little
+        # behind; past the slack, fill in silence. If it gets ahead, skip its oldest
+        # audio. The PC's audio is never altered.
+        ready = min(waiting, max(self._mic.available(), waiting - self._slack))
+        self._mic.keep_last(waiting + self._slack)
+        return ready
+
+
+def start_together(pc, mic):
+    """Wait until the mic is running, then start both sources from the same moment."""
+    deadline = time.monotonic() + NO_AUDIO_TIMEOUT_S
+    while mic.available() == 0:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"no audio arrived from {mic.name}")
+        time.sleep(0.005)
+    pc.discard()
+    mic.keep_last(0)
+
+
+def to_pcm(mix):
+    """Float samples as the bytes of 16-bit ones."""
+    return np.round(np.clip(mix, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+
+
+def record(filename, seconds=None, use_mic=True):
+    """Record to filename until `seconds` have been captured, or until Ctrl+C."""
+    with pyaudio.PyAudio() as audio:
+        pc = PcAudio(audio)
+        with pc, (Mic(pc.rate) if use_mic else contextlib.nullcontext()) as mic:
             if mic:
-                # Start both sources from the same moment, once the mic is running.
-                deadline = time.monotonic() + NO_AUDIO_TIMEOUT_S
-                while mic.available() == 0:
-                    if time.monotonic() > deadline:
-                        raise RuntimeError(f"no audio arrived from {mic.name}")
-                    time.sleep(0.005)
-                while not blocks.empty():
-                    blocks.get()
-                mic.keep_last(0)
-
+                start_together(pc, mic)
+            mixer = Mixer(mic, pc.rate)
+            source = pc.name + (f" + {mic.name}" if mic else "")
+            length = "until Ctrl+C" if seconds is None else f"for {seconds:g} s"
             with wave.open(filename, "wb") as wav:
                 wav.setnchannels(2)
                 wav.setsampwidth(2)
-                wav.setframerate(rate)
+                wav.setframerate(pc.rate)
+                print(f"Recording {source} ({pc.rate} Hz) {length}...", flush=True)
+                limit = None if seconds is None else int(seconds * pc.rate)
+                write_until_stopped(wav, pc, mixer, limit)
+    print(f"Saved {mixer.frames / pc.rate:.1f} s to {filename}")
+    print_levels(mixer, use_mic)
 
-                source = speaker["name"] + (f" + {mic.name}" if mic else "")
-                length = "until Ctrl+C" if seconds is None else f"for {seconds:g} s"
-                print(f"Recording {source} ({rate} Hz) {length}...", flush=True)
-                try:
-                    while limit is None or frames < limit:
-                        data = blocks.get(timeout=NO_AUDIO_TIMEOUT_S)
-                        block = np.frombuffer(data, dtype=np.float32).reshape(-1, channels)
-                        pending = np.concatenate((pending, to_stereo(block)))
 
-                        ready = len(pending)
-                        if mic:
-                            # The two devices' clocks differ slightly. Wait for the mic
-                            # if it is a little behind; past the slack, fill in silence.
-                            # If it gets ahead, skip its oldest audio. The PC's audio is
-                            # never altered.
-                            ready = min(ready, max(mic.available(), len(pending) - slack))
-                            mic.keep_last(len(pending) + slack)
-                        if limit is not None:
-                            ready = min(ready, limit - frames)
-                        if ready == 0:
-                            continue
-                        mix, pending = pending[:ready], pending[ready:]
-                        pc_peak = max(pc_peak, float(np.abs(mix).max()))
-                        if mic:
-                            voice = mic.read(ready)
-                            mic_peak = max(mic_peak, float(np.abs(voice).max()))
-                            mix = mix + voice[:, np.newaxis]
-                        clipped += int((np.abs(mix) > 1.0).any(axis=1).sum())
-                        pcm = np.round(np.clip(mix, -1.0, 1.0) * 32767)
-                        wav.writeframes(pcm.astype("<i2").tobytes())
-                        frames += ready
-                except KeyboardInterrupt:
-                    pass
-                except queue.Empty:
-                    print("The output device stopped delivering audio.")
+def write_until_stopped(wav, pc, mixer, limit):
+    """Write until `limit` frames (None = no limit), Ctrl+C or the device goes quiet."""
+    try:
+        while limit is None or mixer.frames < limit:
+            remaining = None if limit is None else limit - mixer.frames
+            mix = mixer.mix(pc.read(), remaining)
+            if len(mix):
+                wav.writeframes(to_pcm(mix))
+    except KeyboardInterrupt:
+        pass
+    except queue.Empty:
+        print("The output device stopped delivering audio.")
 
-    print(f"Saved {frames / rate:.1f} s to {filename}")
-    print(f"Peak level: PC {pc_peak:.0%}" + (f", mic {mic_peak:.0%}" if use_mic else ""))
-    if use_mic and mic_peak < 0.001:
+
+def print_levels(mixer, use_mic):
+    print(f"Peak level: PC {mixer.pc_peak:.0%}" + (f", mic {mixer.mic_peak:.0%}" if use_mic else ""))
+    if use_mic and mixer.mic_peak < 0.001:
         print("The mic was silent - check it isn't muted.")
-    if clipped:
-        print(f"Too loud in places: {clipped} samples clipped. Turn the mic or the PC down.")
+    if mixer.clipped:
+        print(f"Too loud in places: {mixer.clipped} samples clipped. Turn the mic or the PC down.")
 
 
 def main():
