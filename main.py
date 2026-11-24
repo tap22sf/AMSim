@@ -37,37 +37,23 @@ The signal processing is in dsp.py.
 import os
 import sys
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
 import sounddevice as sd
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from dsp import (AB_MODE, AB_SOURCES, DETECTOR_BW_HZ, FFT_N, LISTEN_SIGNAL, LISTEN_MODES,
-                 MAX_KM, MAX_RECORD_S, MAX_VOLUME, MAX_WAV_S, MESSAGE_BW_HZ, MIN_KM,
-                 SAMPLE_RATE, Simulation, load_wav)
+from amsim.settings import (DETECTOR_BW_HZ, FFT_N, LAUNCH, LAUNCH_RECEIVER_VIEW_MS,
+                            LAUNCH_STATION, MAX_KM, MAX_MODULATION, MAX_RECORD_S, MAX_VOLUME,
+                            MAX_WAV_S, MESSAGE_BW_HZ, MIN_KM, OUTPUT_DEVICE,
+                            RECEIVER_VIEWS_MS, SAMPLE_RATE, SAMPLE_WAVS)
+from amsim.stages import (AB_MODE, AB_SOURCES, AB_STAGES, LISTEN_MODES, LISTEN_SIGNAL,
+                          MAIN_CHAIN, RECEIVER, STAGE_BY_KEY, STAGES, TRANSMITTER)
+from dsp import Simulation, load_wav
 
 # QShortcut lives in QtGui on Qt6 and QtWidgets on Qt5.
 QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
-
-# Where to play. Words that must all appear in the device's "name, host API"
-# (see `python -m sounddevice`). None = the Windows default output.
-OUTPUT_DEVICE = None
-
-# Messages for channels 1, 2 and 3 when no WAV files are given on the command line.
-SAMPLE_WAVS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-               for name in ("capture_20261123_121213.wav", "capture_20261123_121839.wav",
-                            "recording_20261124.wav")]
-
-# Settings at launch. Anything not listed here starts at its value in dsp.py.
-START_CHANNELS = [              # one per station
-    {"fc_hz": 5900.0, "m": 0.8, "volume": 1.0, "distance_km": 6.03, "skywave": 0.1},
-    {"fc_hz": 11750.0, "m": 0.8, "volume": 1.0, "distance_km": 18.2, "skywave": 0.52},
-    {"fc_hz": 18000.0, "m": 0.8, "volume": 1.0, "distance_km": 22.9, "skywave": 0.3},
-]
-START_SELECTED = 2              # channel 3; with WAV files on the command line, channel 1
-START_LISTEN = "Demodulated"
-START_WEATHER = 0.2
 
 # Display
 CARRIER_CYCLES = 3      # carrier plot shows this many cycles, in slow motion
@@ -76,8 +62,6 @@ SLOWMO = 0.02           # carrier plot speed (real time would alias at 60 fps)
 FPS = 60
 OUTPUT_LATENCY_S = 0.2  # speaker buffer. The default can be ~12 ms on macOS: too little
                         # when drawing a frame holds up the audio thread
-RECEIVER_VIEWS_MS = [2, 5, 20, 50]   # time spans offered for the receiver-stage plots
-START_RECEIVER_VIEW_MS = 5
 THREAD_SWITCH_S = 0.0005    # Python's default (5 ms) lets drawing hold up the audio thread
 DISTANCE_SLIDER_STEPS = 1000         # resolution of the (logarithmic) distance slider
 
@@ -88,24 +72,6 @@ class PipelineDiagram(QtWidgets.QWidget):
     Each block shows a live mini-waveform of the signal leaving it; clicking a
     block plays that signal (it just picks the matching Listen mode).
     """
-
-    # key, title, subtitle, listen mode, captured signal, y-range of the thumbnail
-    # (None = scale to fit, for signals whose level depends on distance)
-    STAGES = [
-        ("mic", "Source", "original recording", "Original recording", "original", (-1.5, 1.5)),
-        ("band", "Band-limit", f"low-pass {MESSAGE_BW_HZ / 1000:g} kHz → x(t)", "Message",
-         "message", (-1.1, 1.1)),
-        ("mod", "Modulator", "[1 + m·x(t)] · carrier", "AM signal", "am", (-2.4, 2.4)),
-        ("air", "Air", "all stations + noise", "On the air", "air", None),
-        ("tune", "Tuner", "band-pass around fc", "Tuned", "tuned", None),
-        ("agc", "AGC", "", "After AGC", "agc", (-2.4, 2.4)),
-        ("rect", "Rectifier", "|s(t)|", "Rectified", "rectified", (-0.1, 2.4)),
-        ("lp", "Low-pass", f"{DETECTOR_BW_HZ / 1000:g} kHz → 1 + m·x", "Low-passed",
-         "lowpassed", (-0.1, 2.4)),
-        ("dc", "DC block", "→ audio m·x(t)", "Demodulated", "demod", (-1.1, 1.1)),
-        ("car", "Carrier oscillator", "", "Carrier", "carrier", (-1.2, 1.2)),
-    ]
-    ROW = ["mic", "band", "mod", "air", "tune", "agc", "rect", "lp", "dc"]  # main chain
 
     BG = QtGui.QColor(0, 0, 0)
     BOX = QtGui.QColor(30, 30, 30)
@@ -121,7 +87,7 @@ class PipelineDiagram(QtWidgets.QWidget):
         super().__init__()
         self.sim = sim
         self.on_select = on_select
-        self.view_s = START_RECEIVER_VIEW_MS / 1000
+        self.view_s = LAUNCH_RECEIVER_VIEW_MS / 1000
         self.hover = None
         self.rects = {}
         self.setMouseTracking(True)
@@ -131,13 +97,13 @@ class PipelineDiagram(QtWidgets.QWidget):
     def _layout(self):
         w = self.width()
         margin, gap, top, box_h = 12, 24, 30, 110
-        cols = len(self.ROW)
+        cols = len(MAIN_CHAIN)
         box_w = (w - 2 * margin - gap * (cols - 1)) / cols
         self.rects = {}
-        for i, key in enumerate(self.ROW):
+        for i, key in enumerate(MAIN_CHAIN):
             self.rects[key] = QtCore.QRectF(margin + i * (box_w + gap), top, box_w, box_h)
-        mod = self.rects["mod"]
-        self.rects["car"] = QtCore.QRectF(mod.left(), mod.bottom() + 34, mod.width(), 70)
+        mod = self.rects["modulator"]
+        self.rects["carrier"] = QtCore.QRectF(mod.left(), mod.bottom() + 34, mod.width(), 70)
 
     def _stage_at(self, pos):
         for key, rect in self.rects.items():
@@ -159,17 +125,16 @@ class PipelineDiagram(QtWidgets.QWidget):
     def mousePressEvent(self, event):
         key = self._stage_at(event.position() if hasattr(event, "position") else event.pos())
         if key:
-            mode = next(s[3] for s in self.STAGES if s[0] == key)
-            self.on_select(mode)
+            self.on_select(STAGE_BY_KEY[key].listen_name)
 
     # --- drawing ---
     def _playing_keys(self):
         """Stages currently audible: (solid, outlined-only) sets."""
         listen = self.sim.listen
         if listen == AB_MODE:
-            now = "mic" if self.sim.ab_playing == AB_SOURCES[0] else "dc"
-            return {now}, {"mic", "dc"} - {now}
-        return {s[0] for s in self.STAGES if s[3] == listen}, set()
+            now = AB_STAGES[AB_SOURCES.index(self.sim.ab_playing)]
+            return {now}, set(AB_STAGES) - {now}
+        return {stage.key for stage in STAGES if stage.listen_name == listen}, set()
 
     def _arrow(self, p, a, b):
         p.drawLine(a, b)
@@ -226,9 +191,8 @@ class PipelineDiagram(QtWidgets.QWidget):
         small_font = QtGui.QFont(self.font())
         small_font.setPointSizeF(self.font().pointSizeF() * 0.85)
         station = self.sim.selected_station
-        for label, keys in ((f"TRANSMITTER – CHANNEL {station.number}", ["mic", "band", "mod", "car"]),
-                            (f"RECEIVER – TUNED TO CHANNEL {station.number}",
-                             ["tune", "agc", "rect", "lp", "dc"])):
+        for label, keys in ((f"TRANSMITTER – CHANNEL {station.number}", TRANSMITTER),
+                            (f"RECEIVER – TUNED TO CHANNEL {station.number}", RECEIVER)):
             box = r[keys[0]]
             for k in keys[1:]:
                 box = box.united(r[k])
@@ -242,11 +206,11 @@ class PipelineDiagram(QtWidgets.QWidget):
 
         # Signal-flow arrows.
         p.setPen(QtGui.QPen(self.EDGE, 2))
-        for a, b in zip(self.ROW, self.ROW[1:]):
+        for a, b in zip(MAIN_CHAIN, MAIN_CHAIN[1:]):
             mid_a = QtCore.QPointF(r[a].right(), r[a].center().y())
             mid_b = QtCore.QPointF(r[b].left() - 1, r[b].center().y())
             self._arrow(p, mid_a, mid_b)
-        car, mod = r["car"], r["mod"]
+        car, mod = r["carrier"], r["modulator"]
         self._arrow(p, QtCore.QPointF(car.center().x(), car.top()),
                     QtCore.QPointF(mod.center().x(), mod.bottom() + 1))
         # What else is on the air.
@@ -268,9 +232,9 @@ class PipelineDiagram(QtWidgets.QWidget):
 
         # Blocks.
         solid, outlined = self._playing_keys()
-        for key, title, subtitle, mode, signal, yrange in self.STAGES:
-            rect = r[key]
-            if key == "car":
+        for stage in STAGES:
+            key, subtitle, rect = stage.key, stage.subtitle, r[stage.key]
+            if key == "carrier":
                 subtitle = f"fc = {station.carrier.freq_hz:g} Hz"
             elif key == "agc":
                 subtitle = f"gain {self.sim.agc.gain_db:+d} dB"
@@ -288,23 +252,33 @@ class PipelineDiagram(QtWidgets.QWidget):
             p.setFont(title_font)
             p.setPen(self.PLAYING if key in solid else self.TEXT)
             p.drawText(inner, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop,
-                       ("▶ " if key in solid else "") + title)
+                       ("▶ " if key in solid else "") + stage.title)
             p.setFont(small_font)
             p.setPen(self.DIM)
             p.drawText(inner.adjusted(0, 19, 0, 0),
                        QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop, subtitle)
             wave = QtCore.QRectF(inner.left(), inner.top() + 38, inner.width(),
                                  max(inner.height() - 38, 10))
-            self._thumbnail(p, wave, signal, yrange)
+            self._thumbnail(p, wave, stage.signal, stage.y_range)
 
         p.setPen(self.DIM)
         p.setFont(small_font)
-        p.drawText(QtCore.QRectF(r["rect"].left(), r["car"].top(), r["dc"].right() - r["rect"].left(),
-                                 r["car"].height()),
+        p.drawText(QtCore.QRectF(r["rectifier"].left(), car.top(),
+                                 r["dc_block"].right() - r["rectifier"].left(), car.height()),
                    QtCore.Qt.AlignmentFlag.AlignCenter,
                    "Click any block to listen to the signal leaving it.\n"
                    f"Thumbnails show the last {self.view_s * 1000:g} ms (Receiver view).")
         p.end()
+
+
+@dataclass
+class ReceiverPlot:
+    """One receiver-stage plot: the real signal against what theory predicts."""
+
+    plot: pg.PlotItem
+    signal: str
+    curve: pg.PlotDataItem
+    theory_curves: list
 
 
 def make_plot(layout, row, col, title, xlabel, xunits, ylabel):
@@ -345,7 +319,7 @@ class MainWindow(QtWidgets.QWidget):
         self.air_box = QtWidgets.QCheckBox("On air")
         self.fc_label = QtWidgets.QLabel()
         self.volume_slider, self.volume_label = self.make_slider(round(MAX_VOLUME * 100), 110, 40)
-        self.modulation_slider, self.modulation_label = self.make_slider(150, 130, 60)
+        self.modulation_slider, self.modulation_label = self.make_slider(round(MAX_MODULATION * 100), 130, 60)
         self.distance_slider, self.distance_label = self.make_slider(DISTANCE_SLIDER_STEPS, 150, 60)
         self.skywave_slider, self.skywave_label = self.make_slider(100, 130, 80)
         self.weather_slider, self.weather_label = self.make_slider(100, 150, 120)
@@ -356,7 +330,7 @@ class MainWindow(QtWidgets.QWidget):
         self.listen_box.setCurrentText(sim.listen)
         self.view_box = QtWidgets.QComboBox()
         self.view_box.addItems([f"{ms} ms" for ms in RECEIVER_VIEWS_MS])
-        self.view_box.setCurrentIndex(RECEIVER_VIEWS_MS.index(START_RECEIVER_VIEW_MS))
+        self.view_box.setCurrentIndex(RECEIVER_VIEWS_MS.index(LAUNCH_RECEIVER_VIEW_MS))
 
         self.status = QtWidgets.QLabel()
         self.readout = QtWidgets.QLabel()
@@ -476,16 +450,16 @@ class MainWindow(QtWidgets.QWidget):
             ("④ DC removed = recovered audio<br><small>red: original m·x(t)</small>",
              "audio", (-1.6, 1.6), "demod"),
         ]
-        self.stages = []
+        self.receiver_plots = []
         for col, (title, ylabel, yrange, signal) in enumerate(stage_specs):
             p = make_plot(bottom, 0, col, title, "Time", "s", ylabel)
             p.setYRange(*yrange)
             if col:
-                p.setXLink(self.stages[0][0])
+                p.setXLink(self.receiver_plots[0].plot)
             curve = p.plot(pen=pg.mkPen("y", width=1))
             curve.setDownsampling(auto=True, method="peak")
             refs = [p.plot(pen=ref_pen) for _ in range(2 if col == 0 else 1)]
-            self.stages.append((p, signal, curve, refs))
+            self.receiver_plots.append(ReceiverPlot(p, signal, curve, refs))
 
         # Clickable block diagram of the whole chain.
         self.diagram = PipelineDiagram(sim, self.listen_box.setCurrentText)
@@ -640,7 +614,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_view_changed(self, index):
         self.view_s = RECEIVER_VIEWS_MS[index] / 1000
-        self.stages[0][0].setXRange(-self.view_s, 0, padding=0)
+        self.receiver_plots[0].plot.setXRange(-self.view_s, 0, padding=0)
         self.diagram.view_s = self.view_s
 
     def refresh_controls(self):
@@ -722,10 +696,10 @@ class MainWindow(QtWidgets.QWidget):
                   "rectified": (2 / np.pi * env["rectified"],),
                   "lowpassed": (env["lowpassed"],),
                   "demod": (cap.last("scaled_message", n, self.sim.delays["demod"]),)}
-        for _, signal, curve, refs in self.stages:
-            curve.setData(t, cap.last(signal, n))
-            for ref, y in zip(refs, theory[signal]):
-                ref.setData(t, y)
+        for rp in self.receiver_plots:
+            rp.curve.setData(t, cap.last(rp.signal, n))
+            for curve, y in zip(rp.theory_curves, theory[rp.signal]):
+                curve.setData(t, y)
 
         # Spectrum of the message vs whatever you're listening to (smoothed a little).
         listen = self.sim.listen
@@ -782,22 +756,10 @@ def find_output_device():
         return None
 
 
-def apply_start_settings(sim):
-    for station, start in zip(sim.stations, START_CHANNELS):
-        station.carrier.freq_hz = start["fc_hz"]
-        station.modulation = start["m"]
-        station.volume = start["volume"]
-        station.distance_km = start["distance_km"]
-        station.skywave = start["skywave"]
-    sim.listen = START_LISTEN
-    sim.atmosphere.weather = START_WEATHER
-
-
 def main():
     sys.setswitchinterval(THREAD_SWITCH_S)
     pg.mkQApp("AMSim")
-    sim = Simulation()
-    apply_start_settings(sim)
+    sim = Simulation(LAUNCH)
     win = MainWindow(sim)
     win.show()
     # The samples are optional: if one has been deleted, its station just starts empty.
@@ -807,7 +769,7 @@ def main():
             continue
         win.select_station(i)
         win.open_wav(path)
-    win.select_station(0 if sys.argv[1:] else START_SELECTED)
+    win.select_station(0 if sys.argv[1:] else LAUNCH_STATION)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(win.tick)

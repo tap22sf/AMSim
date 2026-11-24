@@ -9,7 +9,13 @@ import numpy as np
 from scipy.io import wavfile
 
 import dsp
-from dsp import SAMPLE_RATE, Simulation, path_gain
+from amsim.settings import MAX_WAV_S, SAMPLE_RATE, LaunchSettings, StationSettings
+from amsim.stages import LISTEN_MODES
+from dsp import Simulation, path_gain
+
+# Three stations that don't overlap, close by, in clear weather.
+NEUTRAL = LaunchSettings(stations=tuple(StationSettings(carrier_hz=hz)
+                                        for hz in (5500.0, 11750.0, 18000.0)))
 
 
 def voice(seed, seconds=2.0):
@@ -23,7 +29,7 @@ def voice(seed, seconds=2.0):
 
 
 def make(loaded=(0,), seed=1):
-    sim = Simulation(seed)
+    sim = Simulation(NEUTRAL, seed)
     for i in loaded:
         sim.stations[i].looper.set_clip(voice(i))
         sim.stations[i].on_air = True
@@ -193,7 +199,7 @@ class Streaming(unittest.TestCase):
 class Modes(unittest.TestCase):
     def test_every_listen_mode(self):
         sim = make()
-        for mode in dsp.LISTEN_MODES:
+        for mode in LISTEN_MODES:
             sim.listen = mode
             out = np.zeros((512, 1), dtype=np.float32)
             sim.audio_out(out, 512, None, None)
@@ -275,7 +281,7 @@ class Wav(unittest.TestCase):
     def test_long_file_is_trimmed(self):
         clip, truncated = self.load(8000, np.ones(8000 * 130, dtype=np.int16))
         self.assertTrue(truncated)
-        self.assertEqual(len(clip), int(dsp.MAX_WAV_S * SAMPLE_RATE))
+        self.assertEqual(len(clip), int(MAX_WAV_S * SAMPLE_RATE))
 
     def test_bad_samples_are_removed(self):
         data = np.full(1000, 0.5, dtype=np.float32)
