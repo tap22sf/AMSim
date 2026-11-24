@@ -9,7 +9,7 @@ import numpy as np
 from scipy.io import wavfile
 
 import dsp
-from dsp import SAMPLE_RATE, Transmission, path_gain
+from dsp import SAMPLE_RATE, Simulation, path_gain
 
 
 def voice(seed, seconds=2.0):
@@ -23,87 +23,87 @@ def voice(seed, seconds=2.0):
 
 
 def make(loaded=(0,), seed=1):
-    tx = Transmission(seed)
+    sim = Simulation(seed)
     for i in loaded:
-        tx.channels[i].looper.set_clip(voice(i))
-        tx.channels[i].on_air = True
-    return tx
+        sim.stations[i].looper.set_clip(voice(i))
+        sim.stations[i].on_air = True
+    return sim
 
 
-def run(tx, seconds, block=512, names=("demod", "mx")):
+def run(sim, seconds, block=512, names=("demod", "scaled_message")):
     """Simulate and return whole-run recordings of the named signals."""
     got = {n: [] for n in names}
     for _ in range(int(seconds * SAMPLE_RATE / block)):
-        tx.process(block)
+        sim.process(block)
         for n in names:
-            got[n].append(tx.capture.last(n, block))
+            got[n].append(sim.capture.last(n, block))
     return {n: np.concatenate(v) for n, v in got.items()}
 
 
-def quality_db(tx, seconds=3.0, settle=1.0):
+def quality_db(sim, seconds=3.0, settle=1.0):
     """Recovered audio vs the transmitted m·x(t): best-fit signal over the remainder."""
-    got = run(tx, seconds)
-    d = tx.delays["demod"]
+    got = run(sim, seconds)
+    d = sim.delays["demod"]
     skip = int(settle * SAMPLE_RATE)
-    y, x = got["demod"][skip:], got["mx"][skip - d:len(got["mx"]) - d]
+    y, x = got["demod"][skip:], got["scaled_message"][skip - d:len(got["scaled_message"]) - d]
     a = (x @ y) / (x @ x)
     return 10 * np.log10(a * a * (x @ x) / np.sum((y - a * x) ** 2))
 
 
 class Clean(unittest.TestCase):
-    def test_recovers_every_channel(self):
+    def test_recovers_every_station(self):
         for i in range(3):
-            tx = make((i,))
-            tx.channels[0].on_air = i == 0
-            tx.selected = i
-            self.assertGreater(quality_db(tx), 20, f"channel {i + 1}")
+            sim = make((i,))
+            sim.stations[0].on_air = i == 0
+            sim.selected_index = i
+            self.assertGreater(quality_db(sim), 20, f"station {i + 1}")
 
     def test_agc_restores_level_at_any_distance(self):
         for km in (1, 20, 100):
-            tx = make()
-            tx.channels[0].distance_km = km
-            lp = run(tx, 3, names=("lowpassed",))["lowpassed"]
+            sim = make()
+            sim.stations[0].distance_km = km
+            lp = run(sim, 3, names=("lowpassed",))["lowpassed"]
             self.assertAlmostEqual(lp[-SAMPLE_RATE:].mean(), 1.0, delta=0.12)
 
 
-class Channels(unittest.TestCase):
+class Stations(unittest.TestCase):
     def test_other_stations_are_rejected(self):
         for i in range(3):
-            tx = make((0, 1, 2))
-            tx.selected = i
-            self.assertGreater(quality_db(tx), 20, f"channel {i + 1}")
+            sim = make((0, 1, 2))
+            sim.selected_index = i
+            self.assertGreater(quality_db(sim), 20, f"station {i + 1}")
 
     def test_strong_neighbour_bleeds_into_weak_station(self):
-        tx = make((0, 1))
-        tx.selected = 1
-        tx.channels[1].distance_km = 100
-        tx.channels[0].on_air = False
-        run(tx, 5)
-        alone = tx.snr_db
-        tx.channels[0].on_air = True
-        run(tx, 5)      # long enough for the switch-on transient to leave the average
-        self.assertLess(tx.snr_db, alone - 6)
-        tx.channels[0].distance_km = 100        # an equally weak one hardly matters
-        run(tx, 8)
-        self.assertGreater(tx.snr_db, alone - 1)
+        sim = make((0, 1))
+        sim.selected_index = 1
+        sim.stations[1].distance_km = 100
+        sim.stations[0].on_air = False
+        run(sim, 5)
+        alone = sim.snr_db
+        sim.stations[0].on_air = True
+        run(sim, 5)      # long enough for the switch-on transient to leave the average
+        self.assertLess(sim.snr_db, alone - 6)
+        sim.stations[0].distance_km = 100        # an equally weak one hardly matters
+        run(sim, 8)
+        self.assertGreater(sim.snr_db, alone - 1)
 
     def test_settings_are_independent(self):
-        tx = make((0, 1))
-        tx.channels[1].distance_km = 300
-        tx.channels[1].m = 0.1
-        self.assertGreater(quality_db(tx), 20)
+        sim = make((0, 1))
+        sim.stations[1].distance_km = 300
+        sim.stations[1].modulation = 0.1
+        self.assertGreater(quality_db(sim), 20)
 
     def test_overlapping_carriers_interfere(self):
-        tx = make((0, 1))
-        tx.channels[1].carrier.freq_hz = tx.channels[0].carrier.freq_hz + 1000
-        self.assertLess(quality_db(tx), 5)
+        sim = make((0, 1))
+        sim.stations[1].carrier.freq_hz = sim.stations[0].carrier.freq_hz + 1000
+        self.assertLess(quality_db(sim), 5)
 
     def test_switching_settles_quickly(self):
-        tx = make((0, 1))
-        tx.channels[1].distance_km = 100
-        run(tx, 1)
-        tx.selected = 1
-        lp = run(tx, 0.4, names=("lowpassed",))["lowpassed"]
+        sim = make((0, 1))
+        sim.stations[1].distance_km = 100
+        run(sim, 1)
+        sim.selected_index = 1
+        lp = run(sim, 0.4, names=("lowpassed",))["lowpassed"]
         self.assertAlmostEqual(lp[-SAMPLE_RATE // 5:].mean(), 1.0, delta=0.3)
 
 
@@ -111,10 +111,10 @@ class Interference(unittest.TestCase):
     def test_distance_lowers_snr_as_modelled(self):
         snrs = []
         for km in (1, 10, 100, 300, 500):
-            tx = make()
-            tx.channels[0].distance_km = km
-            run(tx, 2)
-            snrs.append(tx.snr_db)
+            sim = make()
+            sim.stations[0].distance_km = km
+            run(sim, 2)
+            snrs.append(sim.snr_db)
         self.assertEqual(snrs, sorted(snrs, reverse=True))
         # A bare carrier at 1 km is NOISE_FLOOR_DB above the noise; modulation adds a little.
         self.assertAlmostEqual(snrs[0], -dsp.NOISE_FLOOR_DB, delta=2.5)
@@ -124,65 +124,65 @@ class Interference(unittest.TestCase):
     def test_weather_lowers_quality(self):
         qs = []
         for w in (0, 0.5, 1.0):
-            tx = make()
-            tx.channels[0].distance_km = 30
-            tx.atmosphere.weather = w
-            qs.append(quality_db(tx, 5))
+            sim = make()
+            sim.stations[0].distance_km = 30
+            sim.atmosphere.weather = w
+            qs.append(quality_db(sim, 5))
         self.assertGreater(qs[0], qs[1] + 3)
         self.assertGreater(qs[1], qs[2] + 3)
 
     def test_lightning_is_impulsive_and_bounded(self):
-        tx = make()
-        tx.atmosphere.weather = 1.0
-        got = run(tx, 10, names=("agc", "demod"))
+        sim = make()
+        sim.atmosphere.weather = 1.0
+        got = run(sim, 10, names=("agc", "demod"))
         self.assertLessEqual(np.abs(got["agc"]).max(), dsp.AGC_CLIP)
         self.assertTrue(np.isfinite(got["demod"]).all())
-        noise = np.concatenate([tx.atmosphere.render(512) for _ in range(900)])
+        noise = np.concatenate([sim.atmosphere.render(512) for _ in range(900)])
         rms = np.sqrt((noise ** 2).mean())
         self.assertGreater(np.abs(noise).max() / rms, 8)     # Gaussian noise: ~5
-        self.assertLess(len(tx.atmosphere._tail), 3 * SAMPLE_RATE)
+        self.assertLess(len(sim.atmosphere._tail), 3 * SAMPLE_RATE)
 
     def test_skywave_fades_and_distorts(self):
-        tx = make()
-        clean = quality_db(tx, 3)
-        tx.channels[0].skywave = 1.0
-        tuned = run(tx, 20, names=("tuned",))["tuned"]
+        sim = make()
+        clean = quality_db(sim, 3)
+        sim.stations[0].skywave = 1.0
+        tuned = run(sim, 20, names=("tuned",))["tuned"]
         seg = tuned[:len(tuned) // 4410 * 4410].reshape(-1, 4410)
         level = 20 * np.log10(np.sqrt((seg ** 2).mean(axis=1)))
         self.assertGreater(level.max() - level.min(), 6)
-        self.assertLess(quality_db(tx, 6), clean - 6)
+        self.assertLess(quality_db(sim, 6), clean - 6)
 
 
 class Streaming(unittest.TestCase):
     def test_block_size_does_not_matter(self):
         outs = []
         for block in (64, 441, 4410):
-            tx = make()
-            tx.atmosphere.render = lambda frames: np.zeros(frames)   # only the signal path
-            tx.channels[0]._gain.value = 1.0                         # skip the start-up ramp
-            outs.append(run(tx, 1.4, block=block)["demod"][:44100])
+            sim = make()
+            sim.atmosphere.render = lambda frames: np.zeros(frames)   # only the signal path
+            sim.stations[0]._gain.value = 1.0                         # skip the start-up ramp
+            outs.append(run(sim, 1.4, block=block)["demod"][:44100])
         for other in outs[1:]:
             np.testing.assert_allclose(other, outs[0], atol=1e-9)
 
     def test_no_click_when_a_slider_moves(self):
-        tx = make(())
-        tx.channels[0].on_air = True             # bare carrier: demod should be ~0
-        run(tx, 2)
-        for name, value in (("distance_km", 1.5), ("m", 0.2), ("distance_km", 1.0)):
-            setattr(tx.channels[0], name, value)
-            y = run(tx, 0.2)["demod"]
+        sim = make(())
+        sim.stations[0].on_air = True             # bare carrier: demod should be ~0
+        run(sim, 2)
+        for name, value in (("distance_km", 1.5), ("modulation", 0.2), ("distance_km", 1.0)):
+            setattr(sim.stations[0], name, value)
+            y = run(sim, 0.2)["demod"]
             self.assertLess(np.abs(np.diff(y)).max(), 0.1, name)
 
     def test_keeps_up_with_real_time(self):
-        tx = make((0, 1, 2))
-        for ch in tx.channels:
-            ch.skywave = 1.0
-        tx.atmosphere.weather = 1.0
+        sim = make((0, 1, 2))
+        for station in sim.stations:
+            station.skywave = 1.0
+        sim.atmosphere.weather = 1.0
         for block in (441, 1024):
             times = []
             for _ in range(200):
                 t = time.perf_counter()
-                tx.process(block)
+                sim.process(block)
                 times.append(time.perf_counter() - t)
             load = np.median(times) / (block / SAMPLE_RATE)
             print(f"\n  audio load, {block}-sample blocks: {load:.0%} median, "
@@ -192,56 +192,56 @@ class Streaming(unittest.TestCase):
 
 class Modes(unittest.TestCase):
     def test_every_listen_mode(self):
-        tx = make()
+        sim = make()
         for mode in dsp.LISTEN_MODES:
-            tx.listen = mode
+            sim.listen = mode
             out = np.zeros((512, 1), dtype=np.float32)
-            tx.audio_out(out, 512, None, None)
+            sim.audio_out(out, 512, None, None)
             self.assertTrue(np.isfinite(out).all(), mode)
 
     def test_volume_is_per_station(self):
-        tx = make((0, 1))
-        tx.listen = "Demodulated"
-        tx.channels[1].volume = 0.0
+        sim = make((0, 1))
+        sim.listen = "Demodulated"
+        sim.stations[1].volume = 0.0
         out = np.zeros((512, 1))
 
         def peak(seconds=0.5):
             """Highest output, after any ramp has finished."""
             got = []
             for _ in range(int(seconds * SAMPLE_RATE / 512)):
-                tx.audio_out(out, 512, None, None)
+                sim.audio_out(out, 512, None, None)
                 got.append(out[:, 0].copy())
             return np.abs(np.concatenate(got)[2048:]).max()
 
         peak(2)
         normal = peak(2)
         self.assertGreater(normal, 0.02)
-        tx.selected = 1
+        sim.selected_index = 1
         self.assertEqual(peak(), 0.0)               # silenced station
-        self.assertGreater(np.abs(tx.capture.last("demod", 4096)).max(), 0.02)
-        tx.selected = 0
+        self.assertGreater(np.abs(sim.capture.last("demod", 4096)).max(), 0.02)
+        sim.selected_index = 0
         self.assertGreater(peak(2), 0.5 * normal)   # the other one is unaffected
-        tx.channels[0].volume = 0.5
+        sim.stations[0].volume = 0.5
         self.assertAlmostEqual(peak(2) / normal, 0.5, delta=0.05)
 
     def test_no_click_when_volume_moves(self):
-        tx = make()
-        tx.listen = "Low-passed"                    # about 1.0 throughout
-        tx.channels[0].m = 0.0
+        sim = make()
+        sim.listen = "Low-passed"                    # about 1.0 throughout
+        sim.stations[0].modulation = 0.0
         out = np.zeros((512, 1))
         for _ in range(100):
-            tx.audio_out(out, 512, None, None)
+            sim.audio_out(out, 512, None, None)
         got = []
         for volume in (0.0, 2.0, 1.0):
-            tx.channels[0].volume = volume
-            tx.audio_out(out, 512, None, None)
+            sim.stations[0].volume = volume
+            sim.audio_out(out, 512, None, None)
             got.append(out[:, 0].copy())
         self.assertLess(np.abs(np.diff(np.concatenate(got))).max(), 0.003)
 
-    def test_muted_while_any_channel_records(self):
-        tx = make((0, 1))
-        tx.channels[1].looper.recording = True
-        self.assertFalse(tx.process(512).any())
+    def test_muted_while_any_station_records(self):
+        sim = make((0, 1))
+        sim.stations[1].looper.recording = True
+        self.assertFalse(sim.process(512).any())
 
 
 class Wav(unittest.TestCase):

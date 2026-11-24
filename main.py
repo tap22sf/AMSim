@@ -43,9 +43,9 @@ import pyqtgraph as pg
 import sounddevice as sd
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from dsp import (AB_MODE, AB_SOURCES, DETECTOR_BW_HZ, FFT_N, LISTEN_CHANNEL, LISTEN_MODES,
+from dsp import (AB_MODE, AB_SOURCES, DETECTOR_BW_HZ, FFT_N, LISTEN_SIGNAL, LISTEN_MODES,
                  MAX_KM, MAX_RECORD_S, MAX_VOLUME, MAX_WAV_S, MESSAGE_BW_HZ, MIN_KM,
-                 SAMPLE_RATE, Transmission, load_wav)
+                 SAMPLE_RATE, Simulation, load_wav)
 
 # QShortcut lives in QtGui on Qt6 and QtWidgets on Qt5.
 QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
@@ -79,7 +79,7 @@ OUTPUT_LATENCY_S = 0.2  # speaker buffer. The default can be ~12 ms on macOS: to
 RECEIVER_VIEWS_MS = [2, 5, 20, 50]   # time spans offered for the receiver-stage plots
 START_RECEIVER_VIEW_MS = 5
 THREAD_SWITCH_S = 0.0005    # Python's default (5 ms) lets drawing hold up the audio thread
-KM_STEPS = 1000         # resolution of the (logarithmic) distance slider
+DISTANCE_SLIDER_STEPS = 1000         # resolution of the (logarithmic) distance slider
 
 
 class PipelineDiagram(QtWidgets.QWidget):
@@ -89,7 +89,7 @@ class PipelineDiagram(QtWidgets.QWidget):
     block plays that signal (it just picks the matching Listen mode).
     """
 
-    # key, title, subtitle, listen mode, captured channel, y-range of the thumbnail
+    # key, title, subtitle, listen mode, captured signal, y-range of the thumbnail
     # (None = scale to fit, for signals whose level depends on distance)
     STAGES = [
         ("mic", "Source", "original recording", "Original recording", "original", (-1.5, 1.5)),
@@ -117,9 +117,9 @@ class PipelineDiagram(QtWidgets.QWidget):
     PLAYING = QtGui.QColor(255, 220, 0)
     GROUP = QtGui.QColor(90, 90, 90)
 
-    def __init__(self, tx, on_select):
+    def __init__(self, sim, on_select):
         super().__init__()
-        self.tx = tx
+        self.sim = sim
         self.on_select = on_select
         self.view_s = START_RECEIVER_VIEW_MS / 1000
         self.hover = None
@@ -165,9 +165,9 @@ class PipelineDiagram(QtWidgets.QWidget):
     # --- drawing ---
     def _playing_keys(self):
         """Stages currently audible: (solid, outlined-only) sets."""
-        listen = self.tx.listen
+        listen = self.sim.listen
         if listen == AB_MODE:
-            now = "mic" if self.tx.ab_playing == AB_SOURCES[0] else "dc"
+            now = "mic" if self.sim.ab_playing == AB_SOURCES[0] else "dc"
             return {now}, {"mic", "dc"} - {now}
         return {s[0] for s in self.STAGES if s[3] == listen}, set()
 
@@ -182,10 +182,10 @@ class PipelineDiagram(QtWidgets.QWidget):
         p.setBrush(p.pen().color())
         p.drawPolygon(head)
 
-    def _thumbnail(self, p, rect, channel, yrange):
+    def _thumbnail(self, p, rect, signal, yrange):
         """Min/max-per-pixel waveform, so dense signals still look right."""
         n = max(int(self.view_s * SAMPLE_RATE), 2)
-        data = self.tx.capture.last(channel, n)
+        data = self.sim.capture.last(signal, n)
         cols = max(int(rect.width()), 2)
         if yrange is None:
             peak = max(np.abs(data).max() * 1.1, 1e-9)
@@ -225,9 +225,9 @@ class PipelineDiagram(QtWidgets.QWidget):
         title_font.setBold(True)
         small_font = QtGui.QFont(self.font())
         small_font.setPointSizeF(self.font().pointSizeF() * 0.85)
-        ch = self.tx.channel
-        for label, keys in ((f"TRANSMITTER – CHANNEL {ch.number}", ["mic", "band", "mod", "car"]),
-                            (f"RECEIVER – TUNED TO CHANNEL {ch.number}",
+        station = self.sim.selected_station
+        for label, keys in ((f"TRANSMITTER – CHANNEL {station.number}", ["mic", "band", "mod", "car"]),
+                            (f"RECEIVER – TUNED TO CHANNEL {station.number}",
                              ["tune", "agc", "rect", "lp", "dc"])):
             box = r[keys[0]]
             for k in keys[1:]:
@@ -259,8 +259,8 @@ class PipelineDiagram(QtWidgets.QWidget):
         p.drawRoundedRect(others, 6, 6)
         lines = [f"CH {c.number}: " + (f"{c.carrier.freq_hz / 1000:g} kHz, {c.distance_km:.3g} km"
                                        if c.on_air else "off air")
-                 for c in self.tx.channels if c is not ch]
-        lines.append(f"Weather: {self.tx.atmosphere.weather:.0%}")
+                 for c in self.sim.stations if c is not station]
+        lines.append(f"Weather: {self.sim.atmosphere.weather:.0%}")
         p.setPen(self.DIM)
         p.setFont(small_font)
         p.drawText(others.adjusted(8, 4, -4, -4), QtCore.Qt.AlignmentFlag.AlignVCenter,
@@ -268,12 +268,12 @@ class PipelineDiagram(QtWidgets.QWidget):
 
         # Blocks.
         solid, outlined = self._playing_keys()
-        for key, title, subtitle, mode, channel, yrange in self.STAGES:
+        for key, title, subtitle, mode, signal, yrange in self.STAGES:
             rect = r[key]
             if key == "car":
-                subtitle = f"fc = {ch.carrier.freq_hz:g} Hz"
+                subtitle = f"fc = {station.carrier.freq_hz:g} Hz"
             elif key == "agc":
-                subtitle = f"gain {self.tx.agc.gain_db:+d} dB"
+                subtitle = f"gain {self.sim.agc.gain_db:+d} dB"
             if key in solid:
                 edge = QtGui.QPen(self.PLAYING, 3)
             elif key in outlined:
@@ -295,7 +295,7 @@ class PipelineDiagram(QtWidgets.QWidget):
                        QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop, subtitle)
             wave = QtCore.QRectF(inner.left(), inner.top() + 38, inner.width(),
                                  max(inner.height() - 38, 10))
-            self._thumbnail(p, wave, channel, yrange)
+            self._thumbnail(p, wave, signal, yrange)
 
         p.setPen(self.DIM)
         p.setFont(small_font)
@@ -316,27 +316,27 @@ def make_plot(layout, row, col, title, xlabel, xunits, ylabel):
 
 
 class MainWindow(QtWidgets.QWidget):
-    def __init__(self, tx):
+    def __init__(self, sim):
         super().__init__()
-        self.tx = tx
+        self.sim = sim
         self.setWindowTitle("AMSim – AM transmission")
         self.resize(1600, 1150)
 
-        # --- controls: one box for the chosen channel, one for everything else ---
-        self.channel_btns = QtWidgets.QButtonGroup(self)
+        # --- controls: one box for the chosen station, one for everything else ---
+        self.station_btns = QtWidgets.QButtonGroup(self)
         selector = QtWidgets.QHBoxLayout()
         selector.setSpacing(0)
-        for i, ch in enumerate(tx.channels):
-            btn = QtWidgets.QPushButton(f"CH {ch.number}")
+        for i, station in enumerate(sim.stations):
+            btn = QtWidgets.QPushButton(f"CH {station.number}")
             btn.setCheckable(True)
             btn.setMinimumHeight(34)
             btn.setStyleSheet("QPushButton:checked { background: #ffdc00; color: black; "
                               "font-weight: bold; }")
             btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-            self.channel_btns.addButton(btn, i)
+            self.station_btns.addButton(btn, i)
             selector.addWidget(btn)
-        self.channel_btns.button(tx.selected).setChecked(True)
-        self.channel_btns.idClicked.connect(self.select_channel)
+        self.station_btns.button(sim.selected_index).setChecked(True)
+        self.station_btns.idClicked.connect(self.select_station)
 
         self.record_btn = QtWidgets.QPushButton("● Record")
         self.stop_btn = QtWidgets.QPushButton("■ Stop")
@@ -344,16 +344,16 @@ class MainWindow(QtWidgets.QWidget):
         self.clear_btn = QtWidgets.QPushButton("Clear")
         self.air_box = QtWidgets.QCheckBox("On air")
         self.fc_label = QtWidgets.QLabel()
-        self.vol_slider, self.vol_label = self.make_slider(round(MAX_VOLUME * 100), 110, 40)
-        self.m_slider, self.m_label = self.make_slider(150, 130, 60)
-        self.km_slider, self.km_label = self.make_slider(KM_STEPS, 150, 60)
-        self.sky_slider, self.sky_label = self.make_slider(100, 130, 80)
+        self.volume_slider, self.volume_label = self.make_slider(round(MAX_VOLUME * 100), 110, 40)
+        self.modulation_slider, self.modulation_label = self.make_slider(150, 130, 60)
+        self.distance_slider, self.distance_label = self.make_slider(DISTANCE_SLIDER_STEPS, 150, 60)
+        self.skywave_slider, self.skywave_label = self.make_slider(100, 130, 80)
         self.weather_slider, self.weather_label = self.make_slider(100, 150, 120)
-        self.weather_slider.setValue(round(tx.atmosphere.weather * 100))
+        self.weather_slider.setValue(round(sim.atmosphere.weather * 100))
 
         self.listen_box = QtWidgets.QComboBox()
         self.listen_box.addItems(LISTEN_MODES)
-        self.listen_box.setCurrentText(tx.listen)
+        self.listen_box.setCurrentText(sim.listen)
         self.view_box = QtWidgets.QComboBox()
         self.view_box.addItems([f"{ms} ms" for ms in RECEIVER_VIEWS_MS])
         self.view_box.setCurrentIndex(RECEIVER_VIEWS_MS.index(START_RECEIVER_VIEW_MS))
@@ -374,10 +374,10 @@ class MainWindow(QtWidgets.QWidget):
         self.open_btn.clicked.connect(self.on_open)
         self.clear_btn.clicked.connect(self.on_clear)
         self.air_box.toggled.connect(self.on_air_toggled)
-        self.vol_slider.valueChanged.connect(self.on_volume_changed)
-        self.m_slider.valueChanged.connect(self.on_m_changed)
-        self.km_slider.valueChanged.connect(self.on_km_changed)
-        self.sky_slider.valueChanged.connect(self.on_sky_changed)
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        self.modulation_slider.valueChanged.connect(self.on_modulation_changed)
+        self.distance_slider.valueChanged.connect(self.on_distance_changed)
+        self.skywave_slider.valueChanged.connect(self.on_skywave_changed)
         self.weather_slider.valueChanged.connect(self.on_weather_changed)
         self.listen_box.currentTextChanged.connect(self.on_listen_changed)
         self.view_box.currentIndexChanged.connect(self.on_view_changed)
@@ -393,14 +393,14 @@ class MainWindow(QtWidgets.QWidget):
             line.addStretch(1)
             return line
 
-        self.channel_group = QtWidgets.QGroupBox()
-        box = QtWidgets.QVBoxLayout(self.channel_group)
+        self.station_group = QtWidgets.QGroupBox()
+        box = QtWidgets.QVBoxLayout(self.station_group)
         box.addLayout(row(self.record_btn, self.stop_btn, self.open_btn, self.clear_btn, 12,
-                          self.air_box, 12, "Volume", self.vol_slider, self.vol_label, 12,
+                          self.air_box, 12, "Volume", self.volume_slider, self.volume_label, 12,
                           self.fc_label))
-        box.addLayout(row("Modulation", self.m_slider, self.m_label, 8,
-                          "Distance", self.km_slider, self.km_label, 8,
-                          "Skywave", self.sky_slider, self.sky_label))
+        box.addLayout(row("Modulation", self.modulation_slider, self.modulation_label, 8,
+                          "Distance", self.distance_slider, self.distance_label, 8,
+                          "Skywave", self.skywave_slider, self.skywave_label))
         shared = QtWidgets.QGroupBox("Shared – all channels")
         box = QtWidgets.QVBoxLayout(shared)
         box.addLayout(row("Listen:", self.listen_box, 12, "Receiver view:", self.view_box))
@@ -408,7 +408,7 @@ class MainWindow(QtWidgets.QWidget):
         controls = QtWidgets.QHBoxLayout()
         controls.addLayout(selector)
         controls.addSpacing(8)
-        controls.addWidget(self.channel_group, stretch=3)
+        controls.addWidget(self.station_group, stretch=3)
         controls.addWidget(shared, stretch=2)
         status_row = QtWidgets.QHBoxLayout()
         status_row.addWidget(self.status, stretch=1)
@@ -446,9 +446,9 @@ class MainWindow(QtWidgets.QWidget):
         self.spec_msg = self.spec_plot.plot(pen=pg.mkPen("c", width=1))
         self.spec_sel = self.spec_plot.plot(pen=pg.mkPen("y", width=1))
         self.fc_lines = []
-        for ch in tx.channels:
+        for station in sim.stations:
             line = pg.InfiniteLine(angle=90, pen=pg.mkPen((255, 255, 255, 80)),
-                                   label=f"CH {ch.number}", labelOpts={"position": 0.95})
+                                   label=f"CH {station.number}", labelOpts={"position": 0.95})
             self.spec_plot.addItem(line)
             self.fc_lines.append(line)
         self.spec_plot.addItem(pg.InfiniteLine(
@@ -465,7 +465,7 @@ class MainWindow(QtWidgets.QWidget):
         # red, what that stage *should* produce in theory, so you can compare.
         ref_pen = pg.mkPen("r", width=2, style=QtCore.Qt.PenStyle.DashLine)
         stage_specs = [
-            # (title, ylabel, y-range, channel)
+            # (title, ylabel, y-range, signal)
             ("① Tuned + AGC = s(t)<br><small>red: ideal envelope ±[1 + m·x]</small>",
              "s(t)", (-2.6, 2.6), "agc"),
             ("② Rectified |s(t)|<br><small>red: its average (2/π)·[1 + m·x]</small>",
@@ -477,7 +477,7 @@ class MainWindow(QtWidgets.QWidget):
              "audio", (-1.6, 1.6), "demod"),
         ]
         self.stages = []
-        for col, (title, ylabel, yrange, channel) in enumerate(stage_specs):
+        for col, (title, ylabel, yrange, signal) in enumerate(stage_specs):
             p = make_plot(bottom, 0, col, title, "Time", "s", ylabel)
             p.setYRange(*yrange)
             if col:
@@ -485,10 +485,10 @@ class MainWindow(QtWidgets.QWidget):
             curve = p.plot(pen=pg.mkPen("y", width=1))
             curve.setDownsampling(auto=True, method="peak")
             refs = [p.plot(pen=ref_pen) for _ in range(2 if col == 0 else 1)]
-            self.stages.append((p, channel, curve, refs))
+            self.stages.append((p, signal, curve, refs))
 
         # Clickable block diagram of the whole chain.
-        self.diagram = PipelineDiagram(tx, self.listen_box.setCurrentText)
+        self.diagram = PipelineDiagram(sim, self.listen_box.setCurrentText)
         self.on_view_changed(self.view_box.currentIndex())
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -503,16 +503,16 @@ class MainWindow(QtWidgets.QWidget):
                             ("Shift+Up", 10), ("Shift+Down", -10),
                             ("PgUp", 1000), ("PgDown", -1000)):
             sc = QShortcut(QtGui.QKeySequence(keys), self)
-            sc.activated.connect(lambda d=delta: self.tx.channel.carrier.nudge(d))
-        for i in range(len(tx.channels)):
+            sc.activated.connect(lambda d=delta: self.sim.selected_station.carrier.nudge(d))
+        for i in range(len(sim.stations)):
             sc = QShortcut(QtGui.QKeySequence(str(i + 1)), self)
-            sc.activated.connect(lambda i=i: self.select_channel(i))
+            sc.activated.connect(lambda i=i: self.select_station(i))
 
-        self.messages = [""] * len(tx.channels)  # per channel: error / info in the status line
+        self.messages = [""] * len(sim.stations)  # per station: error / info in the status line
         self.plot_phase = 0.0
         self.last_t = time.perf_counter()
         self.on_weather_changed(self.weather_slider.value())
-        self.select_channel(tx.selected)
+        self.select_station(sim.selected_index)
 
     @staticmethod
     def make_slider(top, width, label_width):
@@ -526,44 +526,44 @@ class MainWindow(QtWidgets.QWidget):
 
     @property
     def message(self):
-        return self.messages[self.tx.selected]
+        return self.messages[self.sim.selected_index]
 
     @message.setter
     def message(self, text):
-        self.messages[self.tx.selected] = text
+        self.messages[self.sim.selected_index] = text
 
     # --- control handlers ---
-    def select_channel(self, index):
+    def select_station(self, index):
         """Point the channel controls and the receiver at a station."""
-        if self.tx.recording:       # the recording belongs to the current channel
+        if self.sim.recording:       # the recording belongs to the current station
             return
-        self.tx.selected = index
-        ch = self.tx.channel
-        self.channel_btns.button(index).setChecked(True)
-        self.channel_group.setTitle(f"Channel {ch.number}")
-        km_pos = KM_STEPS * np.log(ch.distance_km / MIN_KM) / np.log(MAX_KM / MIN_KM)
-        for slider, value in ((self.vol_slider, ch.volume * 100), (self.m_slider, ch.m * 100), (self.km_slider, km_pos),
-                              (self.sky_slider, ch.skywave * 100)):
-            # Show the channel's settings without writing (rounded) values back to it.
+        self.sim.selected_index = index
+        station = self.sim.selected_station
+        self.station_btns.button(index).setChecked(True)
+        self.station_group.setTitle(f"Channel {station.number}")
+        distance_position = DISTANCE_SLIDER_STEPS * np.log(station.distance_km / MIN_KM) / np.log(MAX_KM / MIN_KM)
+        for slider, value in ((self.volume_slider, station.volume * 100), (self.modulation_slider, station.modulation * 100), (self.distance_slider, distance_position),
+                              (self.skywave_slider, station.skywave * 100)):
+            # Show the station's settings without writing (rounded) values back to it.
             slider.blockSignals(True)
             slider.setValue(round(value))
             slider.blockSignals(False)
-        self.show_channel_labels()
+        self.show_station_labels()
         self.show_sample()
         self.refresh_controls()
 
-    def show_channel_labels(self):
-        ch = self.tx.channel
-        self.vol_label.setText(f"{ch.volume:.0%}")
-        self.m_label.setText(f"m = {ch.m:.2f}")
-        km = ch.distance_km
-        self.km_label.setText(f"{km:.1f} km" if km < 10 else f"{km:.0f} km")
-        self.sky_label.setText("day" if ch.skywave == 0 else
-                               "night" if ch.skywave == 1 else f"{ch.skywave:.0%} night")
+    def show_station_labels(self):
+        station = self.sim.selected_station
+        self.volume_label.setText(f"{station.volume:.0%}")
+        self.modulation_label.setText(f"m = {station.modulation:.2f}")
+        km = station.distance_km
+        self.distance_label.setText(f"{km:.1f} km" if km < 10 else f"{km:.0f} km")
+        self.skywave_label.setText("day" if station.skywave == 0 else
+                               "night" if station.skywave == 1 else f"{station.skywave:.0%} night")
 
     def on_record(self):
         try:
-            self.tx.channel.looper.start_recording()
+            self.sim.selected_station.looper.start_recording()
         except Exception as exc:  # e.g. no microphone available
             self.message = f"Could not open microphone: {exc}"
             return
@@ -572,9 +572,9 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_controls()
 
     def on_stop(self):
-        if self.tx.channel.looper.stop_recording():
+        if self.sim.selected_station.looper.stop_recording():
             self.message = ""
-            self.tx.channel.on_air = True
+            self.sim.selected_station.on_air = True
         else:
             self.message = "Recording was silent – check the mic isn't muted"
         self.show_sample()
@@ -593,50 +593,50 @@ class MainWindow(QtWidgets.QWidget):
         except Exception as exc:  # missing, unreadable or not a WAV file
             self.message = f"Could not open {name}: {exc}"
             return
-        if not self.tx.channel.looper.set_clip(clip):
+        if not self.sim.selected_station.looper.set_clip(clip):
             self.message = f"{name} is silent or too short"
         else:
             self.message = name
-            self.tx.channel.on_air = True
+            self.sim.selected_station.on_air = True
             if truncated:
                 self.message += f", first {MAX_WAV_S:g} s only"
         self.show_sample()
         self.refresh_controls()
 
     def on_clear(self):
-        self.tx.channel.looper.clear()
+        self.sim.selected_station.looper.clear()
         self.message = ""
         self.show_sample()
         self.refresh_controls()
 
-    def on_m_changed(self, value):
-        self.tx.channel.m = value / 100
-        self.show_channel_labels()
+    def on_modulation_changed(self, value):
+        self.sim.selected_station.modulation = value / 100
+        self.show_station_labels()
 
     def on_volume_changed(self, value):
-        self.tx.channel.volume = value / 100
-        self.show_channel_labels()
+        self.sim.selected_station.volume = value / 100
+        self.show_station_labels()
 
-    def on_km_changed(self, value):
+    def on_distance_changed(self, value):
         # Logarithmic: equal slider steps multiply the distance equally.
-        self.tx.channel.distance_km = MIN_KM * (MAX_KM / MIN_KM) ** (value / KM_STEPS)
-        self.show_channel_labels()
+        self.sim.selected_station.distance_km = MIN_KM * (MAX_KM / MIN_KM) ** (value / DISTANCE_SLIDER_STEPS)
+        self.show_station_labels()
 
-    def on_sky_changed(self, value):
-        self.tx.channel.skywave = value / 100
-        self.show_channel_labels()
+    def on_skywave_changed(self, value):
+        self.sim.selected_station.skywave = value / 100
+        self.show_station_labels()
 
     def on_weather_changed(self, value):
-        self.tx.atmosphere.weather = value / 100
+        self.sim.atmosphere.weather = value / 100
         names = ("unsettled", "stormy", "thunderstorm")
         name = "clear" if value == 0 else names[min(value // 34, 2)]
         self.weather_label.setText(f"{value}% {name}")
 
     def on_air_toggled(self, on):
-        self.tx.channel.on_air = on
+        self.sim.selected_station.on_air = on
 
     def on_listen_changed(self, mode):
-        self.tx.listen = mode
+        self.sim.listen = mode
 
     def on_view_changed(self, index):
         self.view_s = RECEIVER_VIEWS_MS[index] / 1000
@@ -644,17 +644,17 @@ class MainWindow(QtWidgets.QWidget):
         self.diagram.view_s = self.view_s
 
     def refresh_controls(self):
-        looper = self.tx.channel.looper
+        looper = self.sim.selected_station.looper
         self.record_btn.setEnabled(not looper.recording)
         self.stop_btn.setEnabled(looper.recording)
         self.open_btn.setEnabled(not looper.recording)
         self.clear_btn.setEnabled(not looper.recording and looper.sample is not None)
-        for btn in self.channel_btns.buttons():
+        for btn in self.station_btns.buttons():
             btn.setEnabled(not looper.recording)
-        self.air_box.setChecked(self.tx.channel.on_air)
+        self.air_box.setChecked(self.sim.selected_station.on_air)
 
     def show_sample(self):
-        sample = self.tx.channel.looper.sample
+        sample = self.sim.selected_station.looper.sample
         if sample is None:
             self.msg_curve.setData([], [])
             self.playhead.hide()
@@ -670,9 +670,9 @@ class MainWindow(QtWidgets.QWidget):
         now = time.perf_counter()
         dt = (now - self.last_t) * SLOWMO
         self.last_t = now
-        ch = self.tx.channel
-        fc = ch.carrier.freq_hz
-        looper = ch.looper
+        station = self.sim.selected_station
+        fc = station.carrier.freq_hz
+        looper = station.looper
 
         # Carrier (slow motion so you can see it move).
         self.plot_phase = (self.plot_phase + 2 * np.pi * fc * dt) % (2 * np.pi)
@@ -693,55 +693,55 @@ class MainWindow(QtWidgets.QWidget):
                 self.on_stop()
         elif looper.sample is not None:
             self.playhead.setPos(looper.pos / SAMPLE_RATE)
-            text = "Transmitting" if ch.on_air else "Off air:"
+            text = "Transmitting" if station.on_air else "Off air:"
             text += f" {len(looper.sample) / SAMPLE_RATE:.1f} s message"
             if self.message:
                 text += f" ({self.message})"
-            if self.tx.listen == AB_MODE:
-                text += f"   ▶ now playing: {self.tx.ab_playing.upper()}"
+            if self.sim.listen == AB_MODE:
+                text += f"   ▶ now playing: {self.sim.ab_playing.upper()}"
             self.status.setText(text)
         else:
             self.status.setText(self.message or "No message – press Record or Open WAV"
-                                + (" (carrier only)" if ch.on_air else " (off air)"))
+                                + (" (carrier only)" if station.on_air else " (off air)"))
 
         self.fc_label.setText(f"fc = {fc:g} Hz  (↑↓ keys)")
-        snr = self.tx.snr_db
+        snr = self.sim.snr_db
         self.readout.setText(
             ("Signal / noise: station is off air" if snr is None else
              f"Signal / (noise + other stations): {snr:.0f} dB")
-            + f"     AGC gain: {self.tx.agc.gain_db:+d} dB")
+            + f"     AGC gain: {self.sim.agc.gain_db:+d} dB")
 
         # Receiver stages: the last few ms that actually went through the receiver.
-        cap = self.tx.capture
+        cap = self.sim.capture
         n = int(self.view_s * SAMPLE_RATE)
         t = (np.arange(n) - n) / SAMPLE_RATE
         # The theory curves come from the transmitter, so shift each by the receiver's
         # filter delay up to that stage.
-        env = {c: cap.last("envelope", n, d) for c, d in self.tx.delays.items()}
+        env = {c: cap.last("envelope", n, d) for c, d in self.sim.delays.items()}
         theory = {"agc": (env["agc"], -env["agc"]),
                   "rectified": (2 / np.pi * env["rectified"],),
                   "lowpassed": (env["lowpassed"],),
-                  "demod": (cap.last("mx", n, self.tx.delays["demod"]),)}
-        for _, channel, curve, refs in self.stages:
-            curve.setData(t, cap.last(channel, n))
-            for ref, y in zip(refs, theory[channel]):
+                  "demod": (cap.last("scaled_message", n, self.sim.delays["demod"]),)}
+        for _, signal, curve, refs in self.stages:
+            curve.setData(t, cap.last(signal, n))
+            for ref, y in zip(refs, theory[signal]):
                 ref.setData(t, y)
 
         # Spectrum of the message vs whatever you're listening to (smoothed a little).
-        listen = self.tx.listen
-        for channel, store, curve in (("air", self.spec_air_db, self.spec_air),
+        listen = self.sim.listen
+        for signal, store, curve in (("air", self.spec_air_db, self.spec_air),
                                       ("message", self.spec_msg_db, self.spec_msg),
-                                      (LISTEN_CHANNEL[listen], self.spec_sel_db, self.spec_sel)):
-            mag = np.abs(np.fft.rfft(cap.last(channel, FFT_N) * self.window)) / self.window_gain
+                                      (LISTEN_SIGNAL[listen], self.spec_sel_db, self.spec_sel)):
+            mag = np.abs(np.fft.rfft(cap.last(signal, FFT_N) * self.window)) / self.window_gain
             db = 20 * np.log10(mag + 1e-6)
             store[:] = 0.7 * store + 0.3 * db
             curve.setData(self.freqs, store)
         self.spec_plot.setTitle(f"Spectrum: message (cyan), {listen} (yellow), air (grey)<br>"
                                 f"<small>shaded: tuner passband &nbsp; green: detector's "
                                 f"{DETECTOR_BW_HZ / 1000:g} kHz low-pass cutoff</small>")
-        for c, line in zip(self.tx.channels, self.fc_lines):
+        for c, line in zip(self.sim.stations, self.fc_lines):
             line.setPos(c.carrier.freq_hz)
-            line.setVisible(c.on_air or c is ch)
+            line.setVisible(c.on_air or c is station)
         self.tuned_band.setRegion((fc - MESSAGE_BW_HZ, fc + MESSAGE_BW_HZ))
 
         self.warning.setText(self.warnings(fc))
@@ -749,9 +749,9 @@ class MainWindow(QtWidgets.QWidget):
 
     def warnings(self, fc):
         msgs = []
-        ch = self.tx.channel
-        if ch.m > 1.0:
-            msgs.append(f"Overmodulated (m = {ch.m:.2f} > 1): the envelope crosses "
+        station = self.sim.selected_station
+        if station.modulation > 1.0:
+            msgs.append(f"Overmodulated (m = {station.modulation:.2f} > 1): the envelope crosses "
                         "zero, so the envelope detector distorts.")
         if fc <= MESSAGE_BW_HZ:
             msgs.append(f"Carrier ({fc:g} Hz) is at or below the message bandwidth "
@@ -762,9 +762,9 @@ class MainWindow(QtWidgets.QWidget):
             # 2fc - bandwidth; it needs to be well above the detector's cutoff.
             msgs.append("Carrier is close to the message bandwidth: carrier ripple leaks "
                         "through the detector's low-pass filter.")
-        for other in self.tx.channels:
+        for other in self.sim.stations:
             spacing = abs(other.carrier.freq_hz - fc)
-            if other is not ch and other.on_air and ch.on_air and spacing < 2 * MESSAGE_BW_HZ:
+            if other is not station and other.on_air and station.on_air and spacing < 2 * MESSAGE_BW_HZ:
                 msgs.append(f"Channel {other.number} is only {spacing:g} Hz away: stations need "
                             f"{2 * MESSAGE_BW_HZ:g} Hz, so their sidebands overlap and the "
                             "tuner can't separate them.")
@@ -782,32 +782,32 @@ def find_output_device():
         return None
 
 
-def apply_start_settings(tx):
-    for ch, start in zip(tx.channels, START_CHANNELS):
-        ch.carrier.freq_hz = start["fc_hz"]
-        ch.m = start["m"]
-        ch.volume = start["volume"]
-        ch.distance_km = start["distance_km"]
-        ch.skywave = start["skywave"]
-    tx.listen = START_LISTEN
-    tx.atmosphere.weather = START_WEATHER
+def apply_start_settings(sim):
+    for station, start in zip(sim.stations, START_CHANNELS):
+        station.carrier.freq_hz = start["fc_hz"]
+        station.modulation = start["m"]
+        station.volume = start["volume"]
+        station.distance_km = start["distance_km"]
+        station.skywave = start["skywave"]
+    sim.listen = START_LISTEN
+    sim.atmosphere.weather = START_WEATHER
 
 
 def main():
     sys.setswitchinterval(THREAD_SWITCH_S)
     pg.mkQApp("AMSim")
-    tx = Transmission()
-    apply_start_settings(tx)
-    win = MainWindow(tx)
+    sim = Simulation()
+    apply_start_settings(sim)
+    win = MainWindow(sim)
     win.show()
-    # The samples are optional: if one has been deleted, its channel just starts empty.
+    # The samples are optional: if one has been deleted, its station just starts empty.
     paths = sys.argv[1:] or SAMPLE_WAVS
-    for i, path in enumerate(paths[:len(tx.channels)]):
+    for i, path in enumerate(paths[:len(sim.stations)]):
         if path in SAMPLE_WAVS and not os.path.exists(path):
             continue
-        win.select_channel(i)
+        win.select_station(i)
         win.open_wav(path)
-    win.select_channel(0 if sys.argv[1:] else START_SELECTED)
+    win.select_station(0 if sys.argv[1:] else START_SELECTED)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(win.tick)
@@ -817,12 +817,12 @@ def main():
     device = find_output_device()
     win.setWindowTitle(f"AMSim – AM transmission  →  {sd.query_devices(device, kind='output')['name']}")
     with sd.OutputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
-                         dtype="float32", latency=OUTPUT_LATENCY_S, callback=tx.audio_out):
+                         dtype="float32", latency=OUTPUT_LATENCY_S, callback=sim.audio_out):
         pg.exec()
 
-    for ch in tx.channels:
-        if ch.looper.recording:
-            ch.looper.stop_recording()
+    for station in sim.stations:
+        if station.looper.recording:
+            station.looper.stop_recording()
 
 
 if __name__ == "__main__":

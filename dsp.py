@@ -1,6 +1,6 @@
 """Signal processing for the AM simulator. No GUI in here.
 
-    Channel (×3):  message -> modulator -> path (distance, skywave fading) --+
+    Station (×3):  message -> modulator -> path (distance, skywave fading) --+
     Atmosphere:    receiver noise + weather ---------------------------------+-> air
     Receiver:      air -> tuner -> AGC -> rectify -> low-pass -> DC block
 
@@ -17,7 +17,7 @@ SAMPLE_RATE = 44100     # audio samples per second (Nyquist = 22.05 kHz)
 OUTPUT_GAIN = 0.2       # overall speaker level; keep it modest
 MAX_VOLUME = 2.0        # top of each station's volume control (1 = normal)
 
-# Channels. Each needs 2 × MESSAGE_BW_HZ = 6 kHz of spectrum, so three of them
+# Stations. Each needs 2 × MESSAGE_BW_HZ = 6 kHz of spectrum, so three of them
 # only just fit under Nyquist: the defaults leave 250 Hz between neighbours.
 START_FCS_HZ = (5500.0, 11750.0, 18000.0)
 MIN_FC_HZ = 10.0
@@ -66,11 +66,11 @@ FFT_N = 8192            # capture length = spectrum resolution: ≈ 5.4 Hz per b
 AB_MODE = "A/B: Original ⇄ Recovered"   # alternates on every pass of the loop
 AB_SOURCES = ("Original", "Recovered")
 # Listen choice -> the captured signal it plays.
-LISTEN_CHANNEL = {"AM signal": "am", "On the air": "air", "Tuned": "tuned", "After AGC": "agc",
+LISTEN_SIGNAL = {"AM signal": "am", "On the air": "air", "Tuned": "tuned", "After AGC": "agc",
                   "Rectified": "rectified", "Low-passed": "lowpassed",
                   "Demodulated": "demod", "Message": "message",
                   "Original recording": "original", AB_MODE: "out", "Carrier": "carrier"}
-LISTEN_MODES = list(LISTEN_CHANNEL)
+LISTEN_MODES = list(LISTEN_SIGNAL)
 START_LISTEN = "Original recording"
 
 
@@ -141,7 +141,7 @@ def load_wav(path):
 
 
 class Looper:
-    """Holds a channel's message (recorded or from a file) and plays it back in a loop.
+    """Holds a station's message (recorded or from a file) and plays it back in a loop.
 
     The stored clip is band-limited to MESSAGE_BW_HZ and normalised to a peak
     of 1, so that the modulation index m means what the textbook says.
@@ -183,7 +183,7 @@ class Looper:
         if clip.size < 64:
             return False
         raw = clip - clip.mean()
-        # Sharp, because the neighbouring channel starts 250 Hz further up.
+        # Sharp, because the neighbouring station starts 250 Hz further up.
         taps = kaiser_lowpass(MESSAGE_BW_HZ - 150, MESSAGE_BW_HZ + 150, 70, SAMPLE_RATE)
         filtered = sps.fftconvolve(raw, taps)[len(taps) // 2:][:len(raw)]  # no delay
         peak = np.max(np.abs(filtered))
@@ -228,20 +228,20 @@ class Looper:
         return sample[ahead % n], sample[(ahead - SKYWAVE_DELAY) % n], original[ahead % n], laps
 
 
-class Channel:
+class Station:
     """One station: its message, its transmitter, and the path to the receiver."""
 
     def __init__(self, number, freq_hz, rng):
         self.number = number
         self.carrier = Carrier(freq_hz)
         self.looper = Looper()
-        self.m = START_M
+        self.modulation = START_M
         self.on_air = False
         self.volume = 1.0           # speaker level while this station is the chosen one
         self.distance_km = MIN_KM
         self.skywave = 0.0          # 0 = day (ground wave only) … 1 = full night
         self._rng = rng
-        self._m = Smooth(START_M)
+        self._modulation = Smooth(START_M)
         self._gain = Smooth(0.0)
         self._sky = Smooth(0.0)
         self._sky_phase = rng.uniform(0, 2 * np.pi)
@@ -251,7 +251,7 @@ class Channel:
         """Next block: dict of the station's signals; "rx" is what reaches the receiver."""
         theta = self.carrier.phases(frames)
         x, x_late, original, laps = self.looper.render(frames)
-        m = self._m.block(self.m, frames)
+        m = self._modulation.block(self.modulation, frames)
         envelope = 1.0 + m * x
         carrier = np.sin(theta)
         am = envelope * carrier                             # leaves the transmitter
@@ -266,7 +266,7 @@ class Channel:
             received = am + sky * (1.0 + m * x_late) * np.sin(theta + phi)
         gain = self._gain.block(path_gain(self.distance_km) if self.on_air else 0.0, frames)
         return {"original": original, "message": x, "envelope": envelope, "carrier": carrier,
-                "am": am, "laps": laps, "rx": gain * received, "mx": m * x}
+                "am": am, "laps": laps, "rx": gain * received, "scaled_message": m * x}
 
     def _drift(self, frames):
         # The drift rate itself wanders slowly, so fades don't come like clockwork.
@@ -448,7 +448,7 @@ class EnvelopeDetector:
         hi_rate = SAMPLE_RATE * OVERSAMPLE
         self._up = Upsampler()
         # Stage 2: the detector's low-pass. 8th order so the 2fc ripple is well
-        # below audibility even for the lowest channel (≈ -70 dB at 11 kHz).
+        # below audibility even for the lowest station (≈ -70 dB at 11 kHz).
         self._lp = StreamFilter(sps.butter(8, DETECTOR_BW_HZ, fs=hi_rate, output="sos"))
         # Only for listening to / plotting stage 1 at 44.1 kHz: anti-alias before
         # dropping samples, otherwise *that* display would be full of aliasing.
@@ -479,13 +479,13 @@ class EnvelopeDetector:
 class Capture:
     """Ring buffer of every signal the audio thread produced, for the plots to read."""
 
-    CHANNELS = ("carrier", "original", "message", "envelope", "mx", "am", "air", "tuned",
+    SIGNALS = ("carrier", "original", "message", "envelope", "scaled_message", "am", "air", "tuned",
                 "agc", "rectified", "lowpassed", "demod", "out")
 
     def __init__(self, size):
         self.size = size
         self.idx = 0
-        self.bufs = {name: np.zeros(size) for name in self.CHANNELS}
+        self.bufs = {name: np.zeros(size) for name in self.SIGNALS}
 
     def write(self, **blocks):
         n = len(next(iter(blocks.values())))
@@ -500,19 +500,19 @@ class Capture:
         return self.bufs[name][where]
 
 
-class Transmission:
+class Simulation:
     """Wires the stations, the air and the receiver together for the audio thread."""
 
     def __init__(self, seed=None):
         rng = np.random.default_rng(seed)
-        self.channels = [Channel(i + 1, fc, rng) for i, fc in enumerate(START_FCS_HZ)]
-        self.channels[0].on_air = True
+        self.stations = [Station(i + 1, fc, rng) for i, fc in enumerate(START_FCS_HZ)]
+        self.stations[0].on_air = True
         self.atmosphere = Atmosphere(rng)
         self.tuner = Tuner(START_FCS_HZ[0], rows=2)
         self.agc = AGC()
         self.detector = EnvelopeDetector()
         self.capture = Capture(FFT_N)
-        self.selected = 0                   # channel being edited and received
+        self.selected_index = 0                   # station being edited and received
         self.listen = START_LISTEN
         self.ab_playing = AB_SOURCES[0]     # which side of the A/B mode is sounding
         self.snr_db = None                  # wanted station vs everything else, after the tuner
@@ -526,23 +526,23 @@ class Transmission:
                        "demod": self.tuner.delay + self.detector.lp_delay}
 
     @property
-    def channel(self):
-        return self.channels[self.selected]
+    def selected_station(self):
+        return self.stations[self.selected_index]
 
     @property
     def recording(self):
-        return any(ch.looper.recording for ch in self.channels)
+        return any(station.looper.recording for station in self.stations)
 
     def process(self, frames):
         """Simulate one block; returns what goes to the speakers (before gain)."""
-        selected = self.selected            # the GUI may change these at any time
+        selected = self.selected_index            # the GUI may change these at any time
         listen = self.listen
         if selected != self._tuned_to:
             self._tuned_to = selected
             self._powers = None
             self.agc.jump()
 
-        signals = [ch.render(frames) for ch in self.channels]
+        signals = [station.render(frames) for station in self.stations]
         sel = signals[selected]
         wanted = sel["rx"]
         unwanted = self.atmosphere.render(frames)
@@ -553,14 +553,14 @@ class Transmission:
         # Wanted and unwanted go through the tuner separately only so the SNR can
         # be measured; the receiver itself uses their sum.
         parts = self.tuner.process(np.stack([wanted, unwanted]),
-                                   self.channels[selected].carrier.freq_hz)
+                                   self.stations[selected].carrier.freq_hz)
         tuned = parts.sum(axis=0)
-        self._measure_snr(parts, self.channels[selected].on_air)
+        self._measure_snr(parts, self.stations[selected].on_air)
         agc = self.agc.process(tuned)
         rectified, lowpassed, demod = self.detector.process(agc)
 
         blocks = {name: sel[name] for name in ("carrier", "original", "message", "envelope",
-                                               "mx", "am")}
+                                               "scaled_message", "am")}
         blocks.update(air=wanted + unwanted, tuned=tuned, agc=agc, rectified=rectified,
                       lowpassed=lowpassed, demod=demod)
         if self.recording:
@@ -573,7 +573,7 @@ class Transmission:
             out = np.where(laps % 2 == 0, sel["original"], demod)
             self.ab_playing = AB_SOURCES[int(laps[-1] % 2)]
         else:
-            out = blocks[LISTEN_CHANNEL[listen]]
+            out = blocks[LISTEN_SIGNAL[listen]]
         self.capture.write(out=out, **blocks)
         return out
 
@@ -589,5 +589,5 @@ class Transmission:
     def audio_out(self, outdata, frames, time_info, status):
         # Volume comes after everything else. Turning the transmitter down instead
         # would do nothing: the AGC would turn it back up.
-        volume = self._volume.block(self.channel.volume, frames)
+        volume = self._volume.block(self.selected_station.volume, frames)
         outdata[:, 0] = np.clip(OUTPUT_GAIN * volume * self.process(frames), -1.0, 1.0)
