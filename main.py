@@ -31,7 +31,8 @@ Controls:
                            stage); the spectrum plot follows this choice
     Receiver view          time span of the receiver-stage plots
 
-The user interface is in amsim/ui and the signal processing in dsp.py.
+The code is in the amsim package: start reading at simulation.py for the signal
+processing, or ui/main_window.py for the user interface.
 """
 
 import os
@@ -42,8 +43,8 @@ import sounddevice as sd
 from pyqtgraph.Qt import QtCore
 
 from amsim.settings import LAUNCH, LAUNCH_STATION, OUTPUT_DEVICE, SAMPLE_RATE, SAMPLE_WAVS
+from amsim.simulation import Simulation
 from amsim.ui.main_window import MainWindow
-from dsp import Simulation
 
 FPS = 60
 OUTPUT_LATENCY_S = 0.2  # speaker buffer. The default can be ~12 ms on macOS: too little
@@ -62,35 +63,46 @@ def find_output_device():
         return None
 
 
+def load_messages(window, paths):
+    """Give the stations their messages, in order."""
+    for index, path in enumerate(paths[:len(window.sim.stations)]):
+        # The samples are optional: if one has been deleted, its station just starts empty.
+        if path in SAMPLE_WAVS and not os.path.exists(path):
+            continue
+        window.select_station(index)
+        window.open_wav(path)
+
+
+def run(window):
+    """Play and draw until the window is closed."""
+    timer = QtCore.QTimer()
+    timer.timeout.connect(window.tick)
+    timer.start(int(1000 / FPS))
+
+    device = find_output_device()
+    device_name = sd.query_devices(device, kind="output")["name"]
+    window.setWindowTitle(f"AMSim – AM transmission  →  {device_name}")
+    # The output plays in a background thread for as long as the window is open.
+    with sd.OutputStream(device=device, samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                         latency=OUTPUT_LATENCY_S, callback=window.sim.audio_out):
+        pg.exec()
+
+
 def main():
     sys.setswitchinterval(THREAD_SWITCH_S)
     pg.mkQApp("AMSim")
     sim = Simulation(LAUNCH)
-    win = MainWindow(sim)
-    win.show()
-    # The samples are optional: if one has been deleted, its station just starts empty.
-    paths = sys.argv[1:] or SAMPLE_WAVS
-    for i, path in enumerate(paths[:len(sim.stations)]):
-        if path in SAMPLE_WAVS and not os.path.exists(path):
-            continue
-        win.select_station(i)
-        win.open_wav(path)
-    win.select_station(0 if sys.argv[1:] else LAUNCH_STATION)
+    window = MainWindow(sim)
+    window.show()
 
-    timer = QtCore.QTimer()
-    timer.timeout.connect(win.tick)
-    timer.start(int(1000 / FPS))
-
-    # Output plays in a background thread for as long as the window is open.
-    device = find_output_device()
-    win.setWindowTitle(f"AMSim – AM transmission  →  {sd.query_devices(device, kind='output')['name']}")
-    with sd.OutputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
-                         dtype="float32", latency=OUTPUT_LATENCY_S, callback=sim.audio_out):
-        pg.exec()
+    wav_files = sys.argv[1:]
+    load_messages(window, wav_files or SAMPLE_WAVS)
+    window.select_station(0 if wav_files else LAUNCH_STATION)
+    run(window)
 
     for station in sim.stations:
-        if station.looper.recording:
-            station.looper.stop_recording()
+        if station.recorder.recording:
+            station.recorder.stop()
 
 
 if __name__ == "__main__":

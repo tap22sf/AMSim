@@ -5,7 +5,7 @@ import os
 import numpy as np
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from dsp import load_wav
+from amsim.message import load_wav
 from amsim.settings import (LAUNCH_RECEIVER_VIEW_MS, MAX_KM, MAX_MODULATION, MAX_RECORD_S,
                             MAX_VOLUME, MAX_WAV_S, MIN_KM, RECEIVER_VIEWS_MS, SAMPLE_RATE)
 from amsim.stages import LISTEN_MODES
@@ -194,18 +194,19 @@ class StationControls(QtWidgets.QGroupBox):
         self._show_available_actions()
 
     def _show_available_actions(self):
-        looper = self.station.looper
-        self.record_button.setEnabled(not looper.recording)
-        self.stop_button.setEnabled(looper.recording)
-        self.open_button.setEnabled(not looper.recording)
-        self.clear_button.setEnabled(not looper.recording and looper.sample is not None)
+        recording = self.station.recorder.recording
+        has_message = self.station.looper.sample is not None
+        self.record_button.setEnabled(not recording)
+        self.stop_button.setEnabled(recording)
+        self.open_button.setEnabled(not recording)
+        self.clear_button.setEnabled(not recording and has_message)
         self.on_air_box.setChecked(self.station.on_air)
-        self.recording_changed.emit(looper.recording)
+        self.recording_changed.emit(recording)
 
     # --- the station's message ---
     def start_recording(self):
         try:
-            self.station.looper.start_recording()
+            self.station.recorder.start()
         except Exception as exc:  # e.g. no microphone available
             self.note = f"Could not open microphone: {exc}"
             return
@@ -213,7 +214,7 @@ class StationControls(QtWidgets.QGroupBox):
         self._show_available_actions()
 
     def stop_recording(self):
-        if self.station.looper.stop_recording():
+        if self.station.stop_recording():
             self.note = ""
             self.station.on_air = True
         else:
@@ -221,8 +222,8 @@ class StationControls(QtWidgets.QGroupBox):
         self._show_new_message()
 
     def stop_recording_if_full(self):
-        looper = self.station.looper
-        if looper.recording and len(looper.recorded_so_far()) >= MAX_RECORD_S * SAMPLE_RATE:
+        recorder = self.station.recorder
+        if recorder.recording and len(recorder.recorded_so_far()) >= MAX_RECORD_S * SAMPLE_RATE:
             self.stop_recording()
 
     def _choose_wav(self):

@@ -100,7 +100,7 @@ class MainWindow(QtWidgets.QWidget):
         self.station_controls.open_wav(path)
 
     def _show_message(self):
-        self.message_plot.show_message(self.sim.selected_station.looper)
+        self.message_plot.show_message(self.sim.selected_station)
 
     def _set_view(self, seconds):
         self.receiver_plots.set_view(seconds)
@@ -112,7 +112,7 @@ class MainWindow(QtWidgets.QWidget):
         self._update_texts()
         station = self.sim.selected_station
         self.carrier_plot.update(station)
-        self.message_plot.update(station.looper)
+        self.message_plot.update(station)
         self.receiver_plots.update(self.sim)
         self.spectrum_plot.update(self.sim)
         self.diagram.update()

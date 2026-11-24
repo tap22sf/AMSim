@@ -1,59 +1,16 @@
-"""Tests for dsp.py. Run with: python -m unittest"""
+"""Tests of the whole chain, from the message to the recovered audio."""
 
-import os
-import tempfile
 import time
 import unittest
 
 import numpy as np
-from scipy.io import wavfile
 
-import dsp
-from amsim.settings import MAX_WAV_S, SAMPLE_RATE, LaunchSettings, StationSettings
+from amsim.atmosphere import NOISE_FLOOR_DB
+from amsim.receiver import AGC_CLIP
+from amsim.settings import SAMPLE_RATE
 from amsim.stages import LISTEN_MODES
-from dsp import Simulation, path_gain
-
-# Three stations that don't overlap, close by, in clear weather.
-NEUTRAL = LaunchSettings(stations=tuple(StationSettings(carrier_hz=hz)
-                                        for hz in (5500.0, 11750.0, 18000.0)))
-
-
-def voice(seed, seconds=2.0):
-    """Speech-like test signal: band-limited noise with a syllable-rate envelope."""
-    rng = np.random.default_rng(seed)
-    n = int(seconds * SAMPLE_RATE)
-    t = np.arange(n) / SAMPLE_RATE
-    f = np.fft.rfftfreq(n, 1 / SAMPLE_RATE)
-    spec = np.fft.rfft(rng.standard_normal(n)) * ((f > 150) & (f < 2700))
-    return np.fft.irfft(spec, n) * (0.6 + 0.4 * np.sin(2 * np.pi * 3 * t))
-
-
-def make(loaded=(0,), seed=1):
-    sim = Simulation(NEUTRAL, seed)
-    for i in loaded:
-        sim.stations[i].looper.set_clip(voice(i))
-        sim.stations[i].on_air = True
-    return sim
-
-
-def run(sim, seconds, block=512, names=("demod", "scaled_message")):
-    """Simulate and return whole-run recordings of the named signals."""
-    got = {n: [] for n in names}
-    for _ in range(int(seconds * SAMPLE_RATE / block)):
-        sim.process(block)
-        for n in names:
-            got[n].append(sim.capture.last(n, block))
-    return {n: np.concatenate(v) for n, v in got.items()}
-
-
-def quality_db(sim, seconds=3.0, settle=1.0):
-    """Recovered audio vs the transmitted m·x(t): best-fit signal over the remainder."""
-    got = run(sim, seconds)
-    d = sim.delays["demod"]
-    skip = int(settle * SAMPLE_RATE)
-    y, x = got["demod"][skip:], got["scaled_message"][skip - d:len(got["scaled_message"]) - d]
-    a = (x @ y) / (x @ x)
-    return 10 * np.log10(a * a * (x @ x) / np.sum((y - a * x) ** 2))
+from amsim.station import path_gain
+from tests.helpers import make, quality_db, run
 
 
 class Clean(unittest.TestCase):
@@ -123,7 +80,7 @@ class Interference(unittest.TestCase):
             snrs.append(sim.snr_db)
         self.assertEqual(snrs, sorted(snrs, reverse=True))
         # A bare carrier at 1 km is NOISE_FLOOR_DB above the noise; modulation adds a little.
-        self.assertAlmostEqual(snrs[0], -dsp.NOISE_FLOOR_DB, delta=2.5)
+        self.assertAlmostEqual(snrs[0], -NOISE_FLOOR_DB, delta=2.5)
         self.assertAlmostEqual(snrs[0] - snrs[2], -20 * np.log10(path_gain(100)), delta=1.5)
         self.assertLess(snrs[-1], 0)
 
@@ -141,7 +98,7 @@ class Interference(unittest.TestCase):
         sim = make()
         sim.atmosphere.weather = 1.0
         got = run(sim, 10, names=("agc", "demod"))
-        self.assertLessEqual(np.abs(got["agc"]).max(), dsp.AGC_CLIP)
+        self.assertLessEqual(np.abs(got["agc"]).max(), AGC_CLIP)
         self.assertTrue(np.isfinite(got["demod"]).all())
         noise = np.concatenate([sim.atmosphere.render(512) for _ in range(900)])
         rms = np.sqrt((noise ** 2).mean())
@@ -246,56 +203,5 @@ class Modes(unittest.TestCase):
 
     def test_muted_while_any_station_records(self):
         sim = make((0, 1))
-        sim.stations[1].looper.recording = True
+        sim.stations[1].recorder.recording = True
         self.assertFalse(sim.process(512).any())
-
-
-class Wav(unittest.TestCase):
-    def load(self, rate, data):
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        try:
-            wavfile.write(path, rate, data)
-            return dsp.load_wav(path)
-        finally:
-            os.remove(path)
-
-    def test_formats(self):
-        for rate in (8000, 22050, 44100, 48000):
-            t = np.arange(rate) / rate
-            tone = np.sin(2 * np.pi * 1000 * t) * 0.5
-            for data in ((tone * 32767).astype(np.int16), (tone * 127 + 128).astype(np.uint8),
-                         tone.astype(np.float32),
-                         np.stack([tone, tone], 1).astype(np.float32)):
-                clip, truncated = self.load(rate, data)
-                self.assertFalse(truncated)
-                looper = dsp.Looper()
-                self.assertTrue(looper.set_clip(clip))
-                x = looper.sample
-                self.assertAlmostEqual(len(x) / SAMPLE_RATE, 1.0, places=2)
-                self.assertAlmostEqual(np.abs(clip).max(), 0.5, delta=0.02)
-                self.assertAlmostEqual(np.abs(x).max(), 1.0, places=5)
-                peak = np.argmax(np.abs(np.fft.rfft(x))) * SAMPLE_RATE / len(x)
-                self.assertAlmostEqual(peak, 1000, delta=2)
-
-    def test_long_file_is_trimmed(self):
-        clip, truncated = self.load(8000, np.ones(8000 * 130, dtype=np.int16))
-        self.assertTrue(truncated)
-        self.assertEqual(len(clip), int(MAX_WAV_S * SAMPLE_RATE))
-
-    def test_bad_samples_are_removed(self):
-        data = np.full(1000, 0.5, dtype=np.float32)
-        data[[10, 20, 30]] = np.nan, np.inf, -np.inf
-        self.assertTrue(np.isfinite(self.load(44100, data)[0]).all())
-
-    def test_silent_clip_is_refused_and_old_one_kept(self):
-        looper = dsp.Looper()
-        looper.set_clip(voice(0))
-        before = looper.sample
-        for clip in (np.zeros(1000), np.zeros(0)):
-            self.assertFalse(looper.set_clip(clip))
-            self.assertIs(looper.sample, before)
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -10,15 +10,15 @@ def status_text(sim, note):
     `note` is the file name or error message that belongs to the station, if any.
     """
     station = sim.selected_station
-    looper = station.looper
-    if looper.recording:
-        seconds = len(looper.recorded_so_far()) / SAMPLE_RATE
+    if station.recorder.recording:
+        seconds = len(station.recorder.recorded_so_far()) / SAMPLE_RATE
         return f"Recording… {seconds:.1f} s (speakers muted)"
-    if looper.sample is None:
+    message = station.looper.sample
+    if message is None:
         return note or ("No message – press Record or Open WAV"
                         + (" (carrier only)" if station.on_air else " (off air)"))
     text = "Transmitting" if station.on_air else "Off air:"
-    text += f" {len(looper.sample) / SAMPLE_RATE:.1f} s message"
+    text += f" {len(message) / SAMPLE_RATE:.1f} s message"
     if note:
         text += f" ({note})"
     if sim.listen == AB_MODE:

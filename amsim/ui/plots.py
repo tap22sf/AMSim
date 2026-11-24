@@ -70,25 +70,26 @@ class MessagePlot:
         self.playhead.hide()
         self.plot.addItem(self.playhead)
 
-    def show_message(self, looper):
+    def show_message(self, station):
         """Draw a station's message. Only needed when it changes."""
-        if looper.sample is None:
+        message = station.looper.sample
+        if message is None:
             self.curve.setData([], [])
             self.playhead.hide()
             return
-        t = np.arange(len(looper.sample)) / SAMPLE_RATE
-        self.curve.setData(t, looper.sample)
+        t = np.arange(len(message)) / SAMPLE_RATE
+        self.curve.setData(t, message)
         self._set_range(t[-1])
         self.playhead.show()
 
-    def update(self, looper):
-        if looper.recording:
-            clip = looper.recorded_so_far()
+    def update(self, station):
+        if station.recorder.recording:
+            clip = station.recorder.recorded_so_far()
             self.playhead.hide()
             self.curve.setData(np.arange(len(clip)) / SAMPLE_RATE, clip)
             self._set_range(max(len(clip) / SAMPLE_RATE, 1.0))
-        elif looper.sample is not None:
-            self.playhead.setPos(looper.pos / SAMPLE_RATE)
+        elif station.looper.sample is not None:
+            self.playhead.setPos(station.looper.pos / SAMPLE_RATE)
 
     def _set_range(self, seconds):
         self.plot.setXRange(0, seconds, padding=0)
