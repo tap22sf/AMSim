@@ -62,7 +62,7 @@ SAMPLE_WAVS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 # Settings at launch. Anything not listed here starts at its value in dsp.py.
 START_CHANNELS = [              # one per station
     {"fc_hz": 5900.0, "m": 0.8, "volume": 1.0, "distance_km": 6.03, "skywave": 0.1},
-    {"fc_hz": 11750.0, "m": 0.8, "volume": 1.0, "distance_km": 1.0, "skywave": 0.0},
+    {"fc_hz": 11750.0, "m": 0.8, "volume": 1.0, "distance_km": 18.2, "skywave": 0.52},
     {"fc_hz": 18000.0, "m": 0.8, "volume": 1.0, "distance_km": 22.9, "skywave": 0.3},
 ]
 START_SELECTED = 2              # channel 3; with WAV files on the command line, channel 1
