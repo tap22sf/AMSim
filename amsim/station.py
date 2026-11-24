@@ -26,7 +26,7 @@ def path_gain(km):
 
 
 class Carrier:
-    """Unit-amplitude sine. Frequency is shared by the GUI and the audio thread."""
+    """The phase of a sine whose frequency can change at any time."""
 
     def __init__(self, freq_hz):
         self.freq_hz = freq_hz
@@ -35,9 +35,9 @@ class Carrier:
     def nudge(self, delta_hz):
         self.freq_hz = float(np.clip(self.freq_hz + delta_hz, MIN_CARRIER_HZ, MAX_CARRIER_HZ))
 
-    def phases(self, frames):
+    def phases(self, frames, freq_hz):
         """Phase of each sample in the next block. Carries over between blocks."""
-        step = 2 * np.pi * self.freq_hz / SAMPLE_RATE
+        step = 2 * np.pi * freq_hz / SAMPLE_RATE
         block = self._phase + step * np.arange(frames)
         self._phase = (self._phase + step * frames) % (2 * np.pi)
         return block
@@ -55,10 +55,16 @@ class StationBlock:
     am: np.ndarray              # envelope · carrier: what leaves the transmitter
     received: np.ndarray        # what reaches the receiver, after distance and fading
     laps: np.ndarray            # completed passes of the message loop, per sample
+    on_air: bool                # the settings this block was made with
+    carrier_hz: float
 
 
 class Station:
-    """One station: its message, its transmitter, and the path to the receiver."""
+    """One station: its message, its transmitter, and the path to the receiver.
+
+    The window sets the attributes without an underscore; the audio thread calls
+    render(). See Simulation for the rules.
+    """
 
     def __init__(self, number, settings, rng):
         self.number = number
@@ -84,7 +90,9 @@ class Station:
 
     def render(self, frames):
         """Simulate the next block. Returns a StationBlock."""
-        theta = self.carrier.phases(frames)
+        on_air = self.on_air                    # each setting is read only once per block
+        carrier_hz = self.carrier.freq_hz
+        theta = self.carrier.phases(frames, carrier_hz)
         loop = self.looper.render(frames, SKYWAVE_DELAY, paused=self.recorder.recording)
         x = loop.message
         m = self._modulation.block(self.modulation, frames)
@@ -100,10 +108,11 @@ class Station:
             # the two alternately add up and cancel, at different moments for
             # the carrier and for each part of the sidebands.
             received = am + sky * (1.0 + m * loop.delayed_message) * np.sin(theta + phi)
-        gain = self._gain.block(path_gain(self.distance_km) if self.on_air else 0.0, frames)
+        gain = self._gain.block(path_gain(self.distance_km) if on_air else 0.0, frames)
         return StationBlock(original=loop.original, message=x, scaled_message=m * x,
                             envelope=envelope, carrier=carrier, am=am,
-                            received=gain * received, laps=loop.laps)
+                            received=gain * received, laps=loop.laps,
+                            on_air=on_air, carrier_hz=carrier_hz)
 
     def _drift(self, frames):
         # The drift rate itself wanders slowly, so fades don't come like clockwork.

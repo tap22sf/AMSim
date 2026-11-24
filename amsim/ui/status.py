@@ -28,10 +28,11 @@ def status_text(sim, note):
 
 def readings_text(sim):
     """Signal-to-noise ratio and AGC gain."""
-    if sim.snr_db is None:
+    snr_db = sim.snr_db     # read once: the audio thread may change it at any time
+    if snr_db is None:
         signal = "Signal / noise: station is off air"
     else:
-        signal = f"Signal / (noise + other stations): {sim.snr_db:.0f} dB"
+        signal = f"Signal / (noise + other stations): {snr_db:.0f} dB"
     return f"{signal}     AGC gain: {sim.agc.gain_db:+d} dB"
 
 

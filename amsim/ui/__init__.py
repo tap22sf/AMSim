@@ -1,1 +1,1 @@
-"""The user interface. Nothing in here changes the signals; see simulation.py for that."""
+"""The user interface. It runs in its own thread: see Simulation for the rules."""
