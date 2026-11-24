@@ -17,7 +17,7 @@ Controls:
     Record / Stop          capture the message from the microphone
     Open WAV…              use a WAV file as the message (or: python main.py a.wav
                            [b.wav [c.wav]] for channels 1 - 3; with no files, the
-                           sample recordings go on channels 1 and 2;
+                           sample recordings go on channels 1 - 3;
                            capture.py records what the PC is playing)
     Clear                  discard the message
     On air                 transmitter on / off (goes on when you give it a message)
@@ -54,9 +54,20 @@ QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
 # (see `python -m sounddevice`). None = the Windows default output.
 OUTPUT_DEVICE = None
 
-# Messages for channels 1, 2 (and 3) when no WAV files are given on the command line.
+# Messages for channels 1, 2 and 3 when no WAV files are given on the command line.
 SAMPLE_WAVS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-               for name in ("capture_20261123_121213.wav", "capture_20261123_121839.wav")]
+               for name in ("capture_20261123_121213.wav", "capture_20261123_121839.wav",
+                            "recording_20261124.wav")]
+
+# Settings at launch. Anything not listed here starts at its value in dsp.py.
+START_CHANNELS = [              # one per station
+    {"fc_hz": 5900.0, "m": 0.8, "volume": 1.0, "distance_km": 6.03, "skywave": 0.1},
+    {"fc_hz": 11750.0, "m": 0.8, "volume": 1.0, "distance_km": 1.0, "skywave": 0.0},
+    {"fc_hz": 18000.0, "m": 0.8, "volume": 1.0, "distance_km": 22.9, "skywave": 0.3},
+]
+START_SELECTED = 2              # channel 3; with WAV files on the command line, channel 1
+START_LISTEN = "Demodulated"
+START_WEATHER = 0.2
 
 # Display
 CARRIER_CYCLES = 3      # carrier plot shows this many cycles, in slow motion
@@ -334,6 +345,7 @@ class MainWindow(QtWidgets.QWidget):
         self.km_slider, self.km_label = self.make_slider(KM_STEPS, 150, 60)
         self.sky_slider, self.sky_label = self.make_slider(100, 130, 80)
         self.weather_slider, self.weather_label = self.make_slider(100, 150, 120)
+        self.weather_slider.setValue(round(tx.atmosphere.weather * 100))
 
         self.listen_box = QtWidgets.QComboBox()
         self.listen_box.addItems(LISTEN_MODES)
@@ -766,10 +778,22 @@ def find_output_device():
         return None
 
 
+def apply_start_settings(tx):
+    for ch, start in zip(tx.channels, START_CHANNELS):
+        ch.carrier.freq_hz = start["fc_hz"]
+        ch.m = start["m"]
+        ch.volume = start["volume"]
+        ch.distance_km = start["distance_km"]
+        ch.skywave = start["skywave"]
+    tx.listen = START_LISTEN
+    tx.atmosphere.weather = START_WEATHER
+
+
 def main():
     sys.setswitchinterval(THREAD_SWITCH_S)
     pg.mkQApp("AMSim")
     tx = Transmission()
+    apply_start_settings(tx)
     win = MainWindow(tx)
     win.show()
     # The samples are optional: if one has been deleted, its channel just starts empty.
@@ -779,7 +803,7 @@ def main():
             continue
         win.select_channel(i)
         win.open_wav(path)
-    win.select_channel(0)
+    win.select_channel(0 if sys.argv[1:] else START_SELECTED)
 
     timer = QtCore.QTimer()
     timer.timeout.connect(win.tick)

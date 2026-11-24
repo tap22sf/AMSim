@@ -6,8 +6,8 @@ original recording to the recovered audio.
 
 ![AMSim with a WAV file on channel 1 and another on channel 2](docs/screenshot.png)
 
-*Two WAV files on the air, on channel 1 (5.5 kHz) and channel 2 (11.75 kHz). The
-receiver is tuned to channel 1 and is playing the demodulated audio. Both stations
+*An example with two WAV files on the air, on channel 1 (5.5 kHz) and channel 2
+(11.75 kHz). The receiver is tuned to channel 1 and is playing the demodulated audio. Both stations
 are visible in the spectrum at the upper right; the shaded band is what the tuner
 lets through.*
 
@@ -21,17 +21,21 @@ pip install numpy scipy sounddevice pyqtgraph PyQt6
 python main.py
 ```
 
-The two sample recordings in this repository load on channels 1 and 2, as in the
-screenshot. To use your own messages instead, give up to three WAV files. They go
-to channels 1, 2 and 3 in order:
+The three sample recordings in this repository load on channels 1, 2 and 3.
+To use your own messages instead, give up to three WAV files. They go to channels 1,
+2 and 3 in order:
 
 ```
 python main.py first.wav second.wav third.wav
 ```
 
-The app starts on **Original recording**, which plays the source audio directly.
-Click the **DC block** (or choose **Demodulated** under **Listen**) to hear what
-the receiver recovers.
+The app starts on **Demodulated**, which plays what the receiver recovers, tuned to
+channel 3 (channel 1 if you give your own files). Click the **Source** block (or
+choose **Original recording** under **Listen**) to hear the source audio directly.
+
+The stations start at different distances, with some skywave fading and 20 % weather.
+To change the launch settings, edit `START_CHANNELS` and the other `START_` values in
+`main.py`.
 
 ## How it works
 
@@ -43,8 +47,8 @@ the receiver recovers.
 
 Everything runs at a 44.1 kHz audio sample rate, so the carriers are between 10 Hz
 and 18 kHz rather than at real broadcast frequencies. That keeps every stage
-audible. Each station occupies 6 kHz, and the default carriers (5.5, 11.75 and
-18 kHz) leave 250 Hz between neighbours.
+audible. Each station occupies 6 kHz, and the default carriers (5.9, 11.75 and
+18 kHz) leave 250 Hz between channels 2 and 3. Channels 1 and 2 overlap by 150 Hz.
 
 ## Using the app
 
