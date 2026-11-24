@@ -16,7 +16,8 @@ Controls:
     PageUp / PageDown      carrier frequency ±1 kHz
     Record / Stop          capture the message from the microphone
     Open WAV…              use a WAV file as the message (or: python main.py a.wav
-                           [b.wav [c.wav]] for channels 1 - 3;
+                           [b.wav [c.wav]] for channels 1 - 3; with no files, the
+                           sample recordings go on channels 1 and 2;
                            capture.py records what the PC is playing)
     Clear                  discard the message
     On air                 transmitter on / off (goes on when you give it a message)
@@ -52,6 +53,10 @@ QShortcut = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
 # Where to play. Words that must all appear in the device's "name, host API"
 # (see `python -m sounddevice`). None = the Windows default output.
 OUTPUT_DEVICE = None
+
+# Messages for channels 1, 2 (and 3) when no WAV files are given on the command line.
+SAMPLE_WAVS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+               for name in ("capture_20261123_121213.wav", "capture_20261123_121839.wav")]
 
 # Display
 CARRIER_CYCLES = 3      # carrier plot shows this many cycles, in slow motion
@@ -299,7 +304,7 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self, tx):
         super().__init__()
         self.tx = tx
-        self.setWindowTitle("FMSim – AM transmission")
+        self.setWindowTitle("AMSim – AM transmission")
         self.resize(1600, 1150)
 
         # --- controls: one box for the chosen channel, one for everything else ---
@@ -763,11 +768,15 @@ def find_output_device():
 
 def main():
     sys.setswitchinterval(THREAD_SWITCH_S)
-    pg.mkQApp("FMSim")
+    pg.mkQApp("AMSim")
     tx = Transmission()
     win = MainWindow(tx)
     win.show()
-    for i, path in enumerate(sys.argv[1:][:len(tx.channels)]):
+    # The samples are optional: if one has been deleted, its channel just starts empty.
+    paths = sys.argv[1:] or SAMPLE_WAVS
+    for i, path in enumerate(paths[:len(tx.channels)]):
+        if path in SAMPLE_WAVS and not os.path.exists(path):
+            continue
         win.select_channel(i)
         win.open_wav(path)
     win.select_channel(0)
@@ -778,7 +787,7 @@ def main():
 
     # Output plays in a background thread for as long as the window is open.
     device = find_output_device()
-    win.setWindowTitle(f"FMSim – AM transmission  →  {sd.query_devices(device, kind='output')['name']}")
+    win.setWindowTitle(f"AMSim – AM transmission  →  {sd.query_devices(device, kind='output')['name']}")
     with sd.OutputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
                          dtype="float32", callback=tx.audio_out):
         pg.exec()
