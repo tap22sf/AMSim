@@ -74,6 +74,8 @@ CARRIER_CYCLES = 3      # carrier plot shows this many cycles, in slow motion
 CARRIER_POINTS = 1000
 SLOWMO = 0.02           # carrier plot speed (real time would alias at 60 fps)
 FPS = 60
+OUTPUT_LATENCY_S = 0.2  # speaker buffer. The default can be ~12 ms on macOS: too little
+                        # when drawing a frame holds up the audio thread
 RECEIVER_VIEWS_MS = [2, 5, 20, 50]   # time spans offered for the receiver-stage plots
 START_RECEIVER_VIEW_MS = 5
 THREAD_SWITCH_S = 0.0005    # Python's default (5 ms) lets drawing hold up the audio thread
@@ -194,7 +196,9 @@ class PipelineDiagram(QtWidgets.QWidget):
         p.setPen(QtGui.QPen(QtGui.QColor(60, 60, 60), 1))
         if lo < 0 < hi:
             p.drawLine(QtCore.QPointF(rect.left(), y_of(0)), QtCore.QPointF(rect.right(), y_of(0)))
-        p.setPen(QtGui.QPen(self.WAVE, 1))
+        # Width 0 = one device pixel. On high-DPI screens a width of 1 is two pixels,
+        # which takes a much slower drawing path.
+        p.setPen(QtGui.QPen(self.WAVE, 0))
         # One zigzag through every column's minimum and maximum, drawn in a single
         # call: much faster than a line per pixel, and drawing competes with audio.
         starts = np.linspace(0, n, cols, endpoint=False).astype(int)
@@ -813,7 +817,7 @@ def main():
     device = find_output_device()
     win.setWindowTitle(f"AMSim – AM transmission  →  {sd.query_devices(device, kind='output')['name']}")
     with sd.OutputStream(device=device, samplerate=SAMPLE_RATE, channels=1,
-                         dtype="float32", callback=tx.audio_out):
+                         dtype="float32", latency=OUTPUT_LATENCY_S, callback=tx.audio_out):
         pg.exec()
 
     for ch in tx.channels:
