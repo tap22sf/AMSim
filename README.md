@@ -4,12 +4,10 @@ An interactive AM (amplitude modulation) radio simulator. Put up to three statio
 receiver to one of them, and see and hear the signal at every step from the
 original recording to the recovered audio.
 
-![AMSim at launch, with three stations on the air and the receiver tuned to channel 3](docs/screenshot.png)
+![AMSim switching from channel 3 to channel 1, then going into a thunderstorm](docs/demo.gif)
 
-*AMSim as it starts, with the three sample recordings on the air on channel 1
-(5.9 kHz), channel 2 (11.75 kHz) and channel 3 (18 kHz). The receiver is tuned to
-channel 3 and is playing the demodulated audio. All three stations are visible in the
-spectrum at the upper right; the shaded band is what the tuner lets through.*
+*Three stations on the air. The receiver switches from channel 3 to channel 1, then the
+weather goes from unsettled to a thunderstorm and the noise swamps the signal.*
 
 ## Getting started
 
@@ -91,6 +89,13 @@ keyboard:
 | **Weather** | Static and lightning, from clear to thunderstorm |
 
 ### Reading the display
+
+![AMSim at launch, with three stations on the air and the receiver tuned to channel 3](docs/screenshot.png)
+
+*AMSim as it starts, with the three sample recordings on the air on channel 1
+(5.9 kHz), channel 2 (11.75 kHz) and channel 3 (18 kHz). The receiver is tuned to
+channel 3 and is playing the demodulated audio. All three stations are visible in the
+spectrum at the upper right; the shaded band is what the tuner lets through.*
 
 - **Status line**: the current message, the ratio of signal to noise and other
   stations, and the AGC gain. Warnings about overmodulation, overlapping stations
